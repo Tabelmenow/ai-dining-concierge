@@ -130,7 +130,8 @@ def book(req: BookingRequest):
         "status": "pending",
         "strategy": strategy,
         "digital_attempt": digital_result,
-        "created_at": bookings[booking_id]["created_at"]
+        "created_at": bookings[booking_id]["created_at"],
+        "call_allowed": call_allowed   
     }
 
 @app.get("/status/{booking_id}")
