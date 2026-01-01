@@ -137,8 +137,12 @@ def book(req: BookingRequest):
         "last_updated_at": now_iso()
     }
 
-    # 5) Store in memory (temporary)
-    bookings[booking_id] = booking_data
+
+    # 5)  Save to Supabase
+    supabase.table("bookings").insert({
+        "id": booking_id,
+        "data": booking_data
+    }).execute()
 
     # 6) Return what Swagger needs
     return {
