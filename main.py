@@ -6,7 +6,7 @@ from twilio.rest import Client
 
 app = FastAPI()
 bookings = {}
-
+ 
 def ai_suggest_strategy(booking: dict) -> dict:
     """
     AI suggestion only.
