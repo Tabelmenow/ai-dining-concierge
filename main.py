@@ -44,12 +44,15 @@ class BookingRequest(BaseModel):
 def book(req: BookingRequest):
     booking_id = str(uuid.uuid4())
 
-    strategy = ai_suggest_strategy(req.dict())
+        strategy = ai_suggest_strategy(req.dict())
+        digital_result = try_digital_booking(req.dict())
+
 
     bookings[booking_id] = {
         "request": req.dict(),
         "status": "pending",
         "strategy": strategy,
+        "digital_attempt": digital_result,
         "confirmation": None
     }
 
