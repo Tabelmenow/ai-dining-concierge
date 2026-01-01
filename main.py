@@ -1,6 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uuid
+import os
+from twilio.rest import Client
 
 app = FastAPI()
 bookings = {}
@@ -39,20 +41,32 @@ def should_call_restaurant(context: dict) -> bool:
         return False
 
     # Only consider calling if strategy supports it (adjust later when you add more strategies)
-    # For now, strategy is always "try_digital_first", so this check mostly documents intent.
     if context["strategy"]["recommended_action"] != "try_digital_first":
         return False
 
     # Don't call for very large groups in this simple prototype
     if context["request"]["party_size"] > 8:
         return False
-        "reason": "Large groups require special handling"
+
     return True
 
-from twilio.rest import Client
-import os
+# -----------------------------
+# Step 11.4: Add real Twilio call code (Founder phone only)
+# -----------------------------
+def make_test_call() -> str:
+    """
+    Makes a test call to the founder's verified phone number.
+    This is for testing only (not calling restaurants yet).
+    """
+    # Basic env var validation (helps debugging)
+    required_vars = ["TWILIO_SID", "TWILIO_AUTH", "TWILIO_NUMBER", "FOUNDER_PHONE"]
+    missing = [v for v in required_vars if not os.environ.get(v)]
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing environment variables: {', '.join(missing)}"
+        )
 
-def make_test_call():
     client = Client(
         os.environ["TWILIO_SID"],
         os.environ["TWILIO_AUTH"]
@@ -113,9 +127,10 @@ def book(req: BookingRequest):
 def status(booking_id: str):
     return bookings.get(booking_id, "Not found")
 
+# -----------------------------
+# Step 11.5: Replace /call-test endpoint to place a real Twilio call
+# -----------------------------
 @app.post("/call-test")
 def call_test():
     sid = make_test_call()
     return {"call_sid": sid}
-
-
