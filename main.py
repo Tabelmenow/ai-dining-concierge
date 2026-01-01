@@ -46,7 +46,7 @@ def should_call_restaurant(context: dict) -> bool:
     # Don't call for very large groups in this simple prototype
     if context["request"]["party_size"] > 8:
         return False
-
+        "reason": "Large groups require special handling"
     return True
 
 class BookingRequest(BaseModel):
