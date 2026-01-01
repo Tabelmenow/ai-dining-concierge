@@ -105,22 +105,28 @@ class BookingRequest(BaseModel):
 def book(req: BookingRequest):
     booking_id = str(uuid.uuid4())
 
+    # Use Pydantic-safe dump (works in v1/v2)
+    try:
+        req_data = req.model_dump()
+    except AttributeError:
+        req_data = req.dict()
+
     # 1) AI suggests strategy (suggest only)
-    strategy = ai_suggest_strategy(req.dict())
+    strategy = ai_suggest_strategy(req_data)
 
     # 2) Try digital first (simulated for now)
-    digital_result = try_digital_booking(req.dict())
+    digital_result = try_digital_booking(req_data)
 
-    # 3) Step 10.3: Save the call decision (deterministic rules)
+    # 3) Decide if a call is allowed (deterministic rules)
     call_allowed = should_call_restaurant({
-        "request": req.dict(),
+        "request": req_data,
         "strategy": strategy,
         "digital_attempt": digital_result
     })
 
-    # 4) Store everything
-      booking_data = {
-        "request": req.dict(),
+    # 4) Build booking record (named variable)
+    booking_data = {
+        "request": req_data,
         "status": "pending",
         "strategy": strategy,
         "digital_attempt": digital_result,
@@ -130,25 +136,20 @@ def book(req: BookingRequest):
         "created_at": now_iso(),
         "last_updated_at": now_iso()
     }
-    
+
+    # 5) Store in memory (temporary)
     bookings[booking_id] = booking_data
 
-     supabase.table("bookings").insert({
-         "id": booking_id,
-         "data": booking_data
-     }).execute()
-
-
- 
-    # 5) Return what you need for testing in Swagger
+    # 6) Return what Swagger needs
     return {
         "booking_id": booking_id,
-        "status": "pending",
-        "strategy": strategy,
-        "digital_attempt": digital_result,
-        "created_at": bookings[booking_id]["created_at"],
-        "call_allowed": call_allowed   
+        "status": booking_data["status"],
+        "strategy": booking_data["strategy"],
+        "digital_attempt": booking_data["digital_attempt"],
+        "created_at": booking_data["created_at"],
+        "call_allowed": booking_data["call_allowed"]
     }
+
 
 @app.get("/status/{booking_id}")
 def status(booking_id: str):
