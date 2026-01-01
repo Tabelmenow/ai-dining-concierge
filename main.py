@@ -11,6 +11,9 @@ def ai_suggest_strategy(booking):
         "reason": "Mid-week booking with small party size has higher digital success rate",
         "confidence": "medium"
     }
+app = FastAPI()
+bookings = {}
+
 def try_digital_booking(booking):
     """
     Simulates a digital booking attempt.
@@ -29,9 +32,6 @@ def try_digital_booking(booking):
             "success": False,
             "reason": "Party size too large for digital"
         }
-
-app = FastAPI()
-bookings = {}
 
 class BookingRequest(BaseModel):
     name: str
