@@ -6,7 +6,15 @@ from twilio.rest import Client
 
 app = FastAPI()
 bookings = {}
- 
+
+from supabase import create_client
+
+supabase = create_client(
+    os.environ["SUPABASE_URL"],
+    os.environ["SUPABASE_KEY"]
+)
+
+
 def ai_suggest_strategy(booking: dict) -> dict:
     """
     AI suggestion only.
@@ -111,17 +119,25 @@ def book(req: BookingRequest):
     })
 
     # 4) Store everything
-    bookings[booking_id] = {
-         "request": req.dict(),
-         "status": "pending",
-         "strategy": strategy,
-         "digital_attempt": digital_result,
-         "call_allowed": call_allowed,  
-         "call": None,          # will store call sid later
-         "confirmation": None,  # will store proof later
-         "created_at": now_iso(),
-         "last_updated_at": now_iso()
-}
+      booking_data = {
+        "request": req.dict(),
+        "status": "pending",
+        "strategy": strategy,
+        "digital_attempt": digital_result,
+        "call_allowed": call_allowed,
+        "call": None,
+        "confirmation": None,
+        "created_at": now_iso(),
+        "last_updated_at": now_iso()
+    }
+    
+    bookings[booking_id] = booking_data
+
+     supabase.table("bookings").insert({
+         "id": booking_id,
+         "data": booking_data
+     }).execute()
+
 
  
     # 5) Return what you need for testing in Swagger
@@ -136,9 +152,17 @@ def book(req: BookingRequest):
 
 @app.get("/status/{booking_id}")
 def status(booking_id: str):
-    if booking_id not in bookings:
+    result = supabase.table("bookings") \
+        .select("data") \
+        .eq("id", booking_id) \
+        .execute()
+
+    if not result.data:
         raise HTTPException(status_code=404, detail="Booking not found")
-    return bookings[booking_id]
+
+    return result.data[0]["data"]
+
+
 
 
 # -----------------------------
