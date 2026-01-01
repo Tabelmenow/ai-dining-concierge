@@ -11,6 +11,24 @@ def ai_suggest_strategy(booking):
         "reason": "Mid-week booking with small party size has higher digital success rate",
         "confidence": "medium"
     }
+def try_digital_booking(booking):
+    """
+    Simulates a digital booking attempt.
+    Does NOT confirm availability.
+    """
+    city = booking["city"]
+    party_size = booking["party_size"]
+
+    if party_size <= 4:
+        return {
+            "success": False,
+            "reason": "No digital availability found"
+        }
+    else:
+        return {
+            "success": False,
+            "reason": "Party size too large for digital"
+        }
 
 app = FastAPI()
 bookings = {}
