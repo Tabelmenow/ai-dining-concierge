@@ -134,3 +134,16 @@ def status(booking_id: str):
 def call_test():
     sid = make_test_call()
     return {"call_sid": sid}
+
+@app.post("/confirm/{booking_id}")
+def confirm_booking(booking_id: str, proof: str):
+    if booking_id not in bookings:
+        return {"error": "Not found"}
+
+    bookings[booking_id]["status"] = "confirmed"
+    bookings[booking_id]["confirmation"] = {
+        "proof": proof
+    }
+
+    return {"message": "Confirmed"}
+
