@@ -1,6 +1,10 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 import uuid
+
+app = FastAPI()
+bookings = {}
+
 def ai_suggest_strategy(booking):
     """
     AI suggestion only.
@@ -11,8 +15,6 @@ def ai_suggest_strategy(booking):
         "reason": "Mid-week booking with small party size has higher digital success rate",
         "confidence": "medium"
     }
-app = FastAPI()
-bookings = {}
 
 def try_digital_booking(booking):
     """
@@ -33,7 +35,6 @@ class BookingRequest(BaseModel):
     time: str
     party_size: int
 
-@app.post("/book")
 @app.post("/book")
 def book(req: BookingRequest):
     booking_id = str(uuid.uuid4())
@@ -68,3 +69,4 @@ def status(booking_id: str):
 @app.post("/call-test")
 def call_test():
     return {"message": "Call triggered (simulation)"}
+
