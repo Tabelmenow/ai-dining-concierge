@@ -49,6 +49,23 @@ def should_call_restaurant(context: dict) -> bool:
         "reason": "Large groups require special handling"
     return True
 
+from twilio.rest import Client
+import os
+
+def make_test_call():
+    client = Client(
+        os.environ["TWILIO_SID"],
+        os.environ["TWILIO_AUTH"]
+    )
+
+    call = client.calls.create(
+        to=os.environ["FOUNDER_PHONE"],
+        from_=os.environ["TWILIO_NUMBER"],
+        url="http://demo.twilio.com/docs/voice.xml"
+    )
+
+    return call.sid
+
 class BookingRequest(BaseModel):
     name: str
     city: str
@@ -98,5 +115,7 @@ def status(booking_id: str):
 
 @app.post("/call-test")
 def call_test():
-    return {"message": "Call triggered (simulation)"}
+    sid = make_test_call()
+    return {"call_sid": sid}
+
 
