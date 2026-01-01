@@ -105,12 +105,7 @@ class BookingRequest(BaseModel):
 def book(req: BookingRequest):
     booking_id = str(uuid.uuid4())
 
-    # Use Pydantic-safe dump (works in v1/v2)
-    try:
-        req_data = req.model_dump()
-    except AttributeError:
-        req_data = req.dict()
-
+    
     # 1) AI suggests strategy (suggest only)
     strategy = ai_suggest_strategy(req_data)
 
