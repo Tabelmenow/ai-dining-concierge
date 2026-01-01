@@ -136,7 +136,10 @@ def book(req: BookingRequest):
 
 @app.get("/status/{booking_id}")
 def status(booking_id: str):
-    return bookings.get(booking_id, "Not found")
+    if booking_id not in bookings:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    return bookings[booking_id]
+
 
 # -----------------------------
 # Step 11.5: Replace /call-test endpoint to place a real Twilio call
