@@ -18,6 +18,12 @@ def ai_suggest_strategy(booking: dict) -> dict:
         "confidence": "medium"
     }
 
+from datetime import datetime, timezone
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
 def try_digital_booking(booking: dict) -> dict:
     """
     Simulates a digital booking attempt.
@@ -106,12 +112,17 @@ def book(req: BookingRequest):
 
     # 4) Store everything
     bookings[booking_id] = {
-        "request": req.dict(),
-        "status": "pending",
-        "strategy": strategy,
-        "digital_attempt": digital_result,
-        "call_allowed": call_allowed,
-        "confirmation": None
+         "request": req.dict(),
+         "status": "pending",
+         "strategy": strategy,
+         "digital_attempt": digital_result,
+         "call_allowed": None,  # if you're using it yet
+         "call": None,          # will store call sid later
+         "confirmation": None,  # will store proof later
+         "created_at": now_iso(),
+         "last_updated_at": now_iso()
+}
+
     }
 
     # 5) Return what you need for testing in Swagger
@@ -121,6 +132,7 @@ def book(req: BookingRequest):
         "strategy": strategy,
         "digital_attempt": digital_result,
         "call_allowed": call_allowed
+        "created_at": bookings[booking_id]["created_at"]
     }
 
 @app.get("/status/{booking_id}")
@@ -130,10 +142,26 @@ def status(booking_id: str):
 # -----------------------------
 # Step 11.5: Replace /call-test endpoint to place a real Twilio call
 # -----------------------------
-@app.post("/call-test")
-def call_test():
-    sid = make_test_call()
-    return {"call_sid": sid}
+@app.post("/call-test/{booking_id}")
+def call_test(booking_id: str):
+    if booking_id not in bookings:
+        return {"error": "Not found"}
+
+    # If you have Twilio working, use make_test_call()
+    # Otherwise simulate:
+    # sid = "SIMULATED_CALL_SID"
+
+    sid = "SIMULATED_CALL_SID"
+
+    bookings[booking_id]["call"] = {
+        "call_sid": sid,
+        "called_at": now_iso(),
+        "to": "FOUNDER_PHONE"
+    }
+    bookings[booking_id]["last_updated_at"] = now_iso()
+
+    return {"message": "Call recorded", "call_sid": sid}
+
 
 @app.post("/confirm/{booking_id}")
 def confirm_booking(booking_id: str, proof: str):
