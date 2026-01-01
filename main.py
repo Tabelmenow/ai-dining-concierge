@@ -116,7 +116,7 @@ def book(req: BookingRequest):
          "status": "pending",
          "strategy": strategy,
          "digital_attempt": digital_result,
-         "call_allowed": None,  # if you're using it yet
+         "call_allowed": call_allowed,  
          "call": None,          # will store call sid later
          "confirmation": None,  # will store proof later
          "created_at": now_iso(),
