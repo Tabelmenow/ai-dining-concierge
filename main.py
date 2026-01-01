@@ -123,15 +123,13 @@ def book(req: BookingRequest):
          "last_updated_at": now_iso()
 }
 
-    }
-
+ 
     # 5) Return what you need for testing in Swagger
     return {
         "booking_id": booking_id,
         "status": "pending",
         "strategy": strategy,
         "digital_attempt": digital_result,
-        "call_allowed": call_allowed
         "created_at": bookings[booking_id]["created_at"]
     }
 
