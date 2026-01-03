@@ -118,6 +118,8 @@ class BookingRequest(BaseModel):
     date: str
     time: str
     party_size: int
+    time_window_minutes: int = 30
+    notes: str = ""
 
 @app.post("/book")
 def book(req: BookingRequest):
@@ -141,6 +143,63 @@ def book(req: BookingRequest):
         "strategy": strategy,
         "digital_attempt": digital_result
     })
+
+from datetime import datetime, timedelta
+
+def compute_time_window(time_str: str, window_minutes: int):
+    """
+    Given '19:00' and 30 minutes, returns:
+    earliest '18:30', latest '19:30'
+    """
+    t = datetime.strptime(time_str, "%H:%M")
+    earliest = (t - timedelta(minutes=window_minutes)).strftime("%H:%M")
+    latest = (t + timedelta(minutes=window_minutes)).strftime("%H:%M")
+    return earliest, latest
+
+
+def build_call_script(booking_data: dict, restaurant_name: str = "the restaurant") -> dict:
+    """
+    Deterministic script. No AI. No claims of availability.
+    Returns a script object you can display and log.
+    """
+    req = booking_data["request"]
+    name = req["name"]
+    party = req["party_size"]
+    date = req["date"]
+    time = req["time"]
+    window = req.get("time_window_minutes", 30)
+    notes = req.get("notes", "")
+
+    earliest, latest = compute_time_window(time, window)
+
+    # Core script (short, polite, outcome-focused)
+    opening = f"Hi there. Quick booking request, please."
+    request_line = f"Could I please book a table for {party} on {date} around {time}, under the name {name}?"
+    fallback_line = f"If {time} isn’t available, anything between {earliest} and {latest} would work."
+    notes_line = f"One note: {notes}" if notes.strip() else ""
+    proof_line = "If you can confirm it, what time is it booked for and what name should I put it under? Any reference number?"
+    close = "Thanks very much. Appreciate it."
+
+    # A “busy” version in case they sound rushed
+    busy_version = [
+        "Sorry to bother you — quick one.",
+        request_line,
+        fallback_line,
+        "Yes/no is perfect. Thank you."
+    ]
+
+    # Return structured script sections
+    script = {
+        "restaurant_name": restaurant_name,
+        "opening": opening,
+        "request": request_line,
+        "fallback": fallback_line,
+        "notes": notes_line,
+        "proof_request": proof_line,
+        "close": close,
+        "busy_version": busy_version
+    }
+    return script
 
     # 4) Build booking record (named variable)
     booking_data = {
@@ -442,5 +501,18 @@ def ui_status(booking_id: str):
     """
     return html
 
-   
+@app.get("/call-script/{booking_id}")
+def call_script(booking_id: str, restaurant_name: str = "the restaurant"):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+
+    result = supabase.table("bookings").select("data").eq("id", booking_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    booking_data = result.data[0]["data"]
+
+    script = build_call_script(booking_data, restaurant_name=restaurant_name)
+    return {"booking_id": booking_id, "script": script}
+
 
