@@ -2,3 +2,5 @@ fastapi
 uvicorn
 twilio
 supabase
+python-multipart==0.0.9
+
