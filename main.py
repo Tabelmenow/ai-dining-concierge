@@ -262,9 +262,9 @@ def call_test(booking_id: str):
 @app.post("/confirm/{booking_id}")
 def confirm_booking(
     booking_id: str,
-    proof: str = Query(..., min_length=10),
-    confirmed_by: str = Query(..., min_length=2),
-    method: str = Query(..., pattern="^(phone|digital|in_person)$")
+    proof: str = Query(..., min_length=10, description="Human-verifiable proof text"),
+    confirmed_by: str = Query(..., min_length=2, description="Who confirmed it"),
+    method: str = Query(..., pattern="^(phone|digital|in_person)$", description="How it was verified")
 ):
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not configured")
