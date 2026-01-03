@@ -309,4 +309,39 @@ def confirm_booking(
 
     return {"message": "Confirmed", "booking_id": booking_id}
 
+@app.get("/timeline/{booking_id}")
+def timeline(booking_id: str):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
 
+    result = supabase.table("bookings").select("data").eq("id", booking_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    booking_data = result.data[0]["data"]
+    events = booking_data.get("events", [])
+
+    # Convert raw events into user-friendly steps
+    timeline = []
+
+    for event in events:
+        if event["type"] == "booking_created":
+            timeline.append({"step": "Request received", "time": event["time"]})
+
+        elif event["type"] == "digital_attempted":
+            timeline.append({"step": "Searching digitally", "time": event["time"]})
+
+        elif event["type"] == "call_initiated":
+            timeline.append({"step": "Calling restaurant to confirm", "time": event["time"]})
+
+        elif event["type"] == "call_recorded":
+            timeline.append({"step": "Spoke to restaurant", "time": event["time"]})
+
+        elif event["type"] == "confirmation_recorded":
+            timeline.append({"step": "Booking confirmed", "time": event["time"]})
+
+    return {
+        "booking_id": booking_id,
+        "status": booking_data.get("status"),
+        "timeline": timeline
+    }
