@@ -346,30 +346,30 @@ def timeline(booking_id: str):
         "timeline": timeline
     }
 
-    @app.post("/ui/book")
-    def ui_book(
-        name: str = Form(...),
-        city: str = Form(...),
-        date: str = Form(...),
-        time: str = Form(...),
-        party_size: int = Form(...)
-    ):
-        # Reuse your existing BookingRequest model and /book logic
-        req = BookingRequest(
-            name=name,
-            city=city,
-            date=date,
-            time=time,
-            party_size=party_size
-        )
+@app.post("/ui/book")
+def ui_book(
+    name: str = Form(...),
+    city: str = Form(...),
+    date: str = Form(...),
+    time: str = Form(...),
+    party_size: int = Form(...)
+):
+    # Reuse your existing BookingRequest model and /book logic
+    req = BookingRequest(
+        name=name,
+        city=city,
+        date=date,
+        time=time,
+        party_size=party_size
+    )
     
-        result = book(req)
-        booking_id = result["booking_id"]
+    result = book(req)
+    booking_id = result["booking_id"]
     
-        # Send user to the status page
-        return RedirectResponse(url=f"/ui/status/{booking_id}", status_code=303)
+    # Send user to the status page
+    return RedirectResponse(url=f"/ui/status/{booking_id}", status_code=303)
 
-    @app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
 def home():
     return """
     <html>
@@ -405,42 +405,42 @@ def home():
     </html>
     """
     
-    @app.get("/ui/status/{booking_id}", response_class=HTMLResponse)
-    def ui_status(booking_id: str):
-        data = timeline(booking_id)   # reuse your /timeline endpoint
-        status_text = data.get("status", "unknown")
-        steps = data.get("timeline", [])
+@app.get("/ui/status/{booking_id}", response_class=HTMLResponse)
+def ui_status(booking_id: str):
+    data = timeline(booking_id)   # reuse your /timeline endpoint
+    status_text = data.get("status", "unknown")
+    steps = data.get("timeline", [])
     
-        html = f"""
-        <html>
-            <head>
-                <title>Booking Status</title>
-            </head>
-            <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto;">
-                <h1>Booking Status</h1>
-                <p><strong>Status:</strong> {status_text}</p>
-    
-                <h2>Progress</h2>
-                <ul>
-        """
-    
-        if not steps:
-            html += "<li>No events yet. Refresh in a few seconds.</li>"
-        else:
-            for item in steps:
-                html += f"<li>{item['step']} <br><small>{item['time']}</small></li>"
-    
-        html += f"""
-                </ul>
-    
-                <p><button onclick="location.reload()">Refresh</button></p>
-    
-                <hr style="margin: 30px 0;">
-                <p><small>Booking ID: {booking_id}</small></p>
-            </body>
-        </html>
-        """
-        return html
+    html = f"""
+    <html>
+        <head>
+            <title>Booking Status</title>
+        </head>
+        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto;">
+            <h1>Booking Status</h1>
+            <p><strong>Status:</strong> {status_text}</p>
+
+            <h2>Progress</h2>
+            <ul>
+    """
+
+    if not steps:
+        html += "<li>No events yet. Refresh in a few seconds.</li>"
+    else:
+        for item in steps:
+            html += f"<li>{item['step']} <br><small>{item['time']}</small></li>"
+
+    html += f"""
+            </ul>
+
+            <p><button onclick="location.reload()">Refresh</button></p>
+
+            <hr style="margin: 30px 0;">
+            <p><small>Booking ID: {booking_id}</small></p>
+        </body>
+    </html>
+    """
+    return html
 
 
     
