@@ -300,6 +300,8 @@ def call_test(booking_id: str):
         raise HTTPException(status_code=400, detail="Call already recorded for this booking")
 
     # 3) Place real Twilio call
+    script = build_call_script(booking_data, restaurant_name="TEST")
+    log_event(booking_data, "call_script_generated", {"script": script})
     log_event(booking_data, "call_initiated", {"mode": "twilio"})
     sid = make_test_call()
 
@@ -348,6 +350,9 @@ def confirm_booking(
         call_obj = booking_data.get("call") or {}
         if not call_obj.get("call_sid"):
             raise HTTPException(status_code=400, detail="Cannot confirm by phone without a recorded call SID")
+        outcome_obj = booking_data.get("call_outcome") or {}
+        if outcome_obj.get("outcome") != "CONFIRMED":
+            raise HTTPException(status_code=400, detail="Cannot confirm by phone unless call outcome is CONFIRMED")
 
     # 3) Set confirmation
     booking_data["status"] = "confirmed"
@@ -514,5 +519,34 @@ def call_script(booking_id: str, restaurant_name: str = "the restaurant"):
 
     script = build_call_script(booking_data, restaurant_name=restaurant_name)
     return {"booking_id": booking_id, "script": script}
+
+@app.post("/call-outcome/{booking_id}")
+def call_outcome(
+    booking_id: str,
+    outcome: str = Query(..., pattern="^(NO_ANSWER|DECLINED|OFFERED_ALTERNATIVE|CONFIRMED)$"),
+    notes: str = Query("", max_length=300),
+    confirmed_time: str = Query("", description="Only if outcome=CONFIRMED, e.g. 19:15"),
+    reference: str = Query("", max_length=100)
+):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+
+    result = supabase.table("bookings").select("data").eq("id", booking_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    booking_data = result.data[0]["data"]
+
+    booking_data["call_outcome"] = {
+        "outcome": outcome,
+        "notes": notes,
+        "confirmed_time": confirmed_time,
+        "reference": reference,
+        "recorded_at": now_iso()
+    }
+    log_event(booking_data, "call_outcome_recorded", booking_data["call_outcome"])
+
+    supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
+    return {"message": "Call outcome saved", "booking_id": booking_id, "outcome": outcome}
 
 
