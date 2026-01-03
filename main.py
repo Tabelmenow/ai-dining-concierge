@@ -3,16 +3,17 @@ from pydantic import BaseModel
 import uuid
 import os
 from twilio.rest import Client
-
-app = FastAPI()
-bookings = {}
-
 from supabase import create_client
 
-supabase = create_client(
-    os.environ["SUPABASE_URL"],
-    os.environ["SUPABASE_KEY"]
-)
+
+app = FastAPI()
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    supabase = None
+else:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 def ai_suggest_strategy(booking: dict) -> dict:
@@ -138,11 +139,15 @@ def book(req: BookingRequest):
     }
 
 
-    # 5)  Save to Supabase
-    supabase.table("bookings").insert({
-        "id": booking_id,
-        "data": booking_data
-    }).execute()
+    # 5) Save to Supabase
+    if supabase:
+        supabase.table("bookings").insert({
+            "id": booking_id,
+            "data": booking_data
+        }).execute()
+    else:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+
 
     # 6) Return what Swagger needs
     return {
@@ -157,15 +162,16 @@ def book(req: BookingRequest):
 
 @app.get("/status/{booking_id}")
 def status(booking_id: str):
-    result = supabase.table("bookings") \
-        .select("data") \
-        .eq("id", booking_id) \
-        .execute()
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+
+    result = supabase.table("bookings").select("data").eq("id", booking_id).execute()
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Booking not found")
 
     return result.data[0]["data"]
+
 
 from urllib.parse import urlparse
 
@@ -178,6 +184,7 @@ def debug_env():
         "SUPABASE_URL_set": bool(supa_url),
         "SUPABASE_URL_scheme": parsed.scheme if parsed else None,
         "SUPABASE_URL_netloc": parsed.netloc if parsed else None,
+        "SUPABASE_KEY_set": bool(os.environ.get("SUPABASE_KEY")),
         "TWILIO_SID_set": bool(os.environ.get("TWILIO_SID")),
         "TWILIO_NUMBER_set": bool(os.environ.get("TWILIO_NUMBER")),
         "FOUNDER_PHONE_set": bool(os.environ.get("FOUNDER_PHONE")),
@@ -190,34 +197,56 @@ def debug_env():
 # -----------------------------
 @app.post("/call-test/{booking_id}")
 def call_test(booking_id: str):
-    if booking_id not in bookings:
-        return {"error": "Not found"}
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
 
-    # If you have Twilio working, use make_test_call()
-    # Otherwise simulate:
-    # sid = "SIMULATED_CALL_SID"
+    # 1) Load booking from Supabase
+    result = supabase.table("bookings").select("data").eq("id", booking_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
 
-    sid = "SIMULATED_CALL_SID"
+    booking_data = result.data[0]["data"]
 
-    bookings[booking_id]["call"] = {
+    # 2) Make or simulate call
+    sid = "SIMULATED_CALL_SID"  # switch to make_test_call() once ready
+
+    # 3) Update booking_data with call record
+    booking_data["call"] = {
         "call_sid": sid,
         "called_at": now_iso(),
         "to": "FOUNDER_PHONE"
     }
-    bookings[booking_id]["last_updated_at"] = now_iso()
+    booking_data["last_updated_at"] = now_iso()
+
+    # 4) Save back to Supabase
+    supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
 
     return {"message": "Call recorded", "call_sid": sid}
 
 
+
 @app.post("/confirm/{booking_id}")
 def confirm_booking(booking_id: str, proof: str):
-    if booking_id not in bookings:
-        return {"error": "Not found"}
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
 
-    bookings[booking_id]["status"] = "confirmed"
-    bookings[booking_id]["confirmation"] = {
-        "proof": proof
+    # 1) Load booking
+    result = supabase.table("bookings").select("data").eq("id", booking_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    booking_data = result.data[0]["data"]
+
+    # 2) Update booking
+    booking_data["status"] = "confirmed"
+    booking_data["confirmation"] = {
+        "proof": proof,
+        "confirmed_at": now_iso()
     }
+    booking_data["last_updated_at"] = now_iso()
 
-    return {"message": "Confirmed"}
+    # 3) Save back
+    supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
+
+    return {"message": "Confirmed", "booking_id": booking_id}
 
