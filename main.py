@@ -167,6 +167,21 @@ def status(booking_id: str):
 
     return result.data[0]["data"]
 
+from urllib.parse import urlparse
+
+@app.get("/debug/env")
+def debug_env():
+    supa_url = os.environ.get("SUPABASE_URL", "")
+    parsed = urlparse(supa_url) if supa_url else None
+
+    return {
+        "SUPABASE_URL_set": bool(supa_url),
+        "SUPABASE_URL_scheme": parsed.scheme if parsed else None,
+        "SUPABASE_URL_netloc": parsed.netloc if parsed else None,
+        "TWILIO_SID_set": bool(os.environ.get("TWILIO_SID")),
+        "TWILIO_NUMBER_set": bool(os.environ.get("TWILIO_NUMBER")),
+        "FOUNDER_PHONE_set": bool(os.environ.get("FOUNDER_PHONE")),
+    }
 
 
 
