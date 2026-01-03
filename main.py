@@ -208,7 +208,7 @@ def call_test(booking_id: str):
     booking_data = result.data[0]["data"]
 
     # 2) Make or simulate call
-    sid = "SIMULATED_CALL_SID"  # switch to make_test_call() once ready
+    sid = make_test_call()
 
     # 3) Update booking_data with call record
     booking_data["call"] = {
