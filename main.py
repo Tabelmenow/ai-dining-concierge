@@ -442,6 +442,5 @@ def ui_status(booking_id: str):
     """
     return html
 
-
-    
+   
 
