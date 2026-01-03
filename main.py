@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException
-from fastapi import Query
+from fastapi import FastAPI, HTTPException, Query, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 import uuid
 import os
@@ -345,3 +345,103 @@ def timeline(booking_id: str):
         "status": booking_data.get("status"),
         "timeline": timeline
     }
+
+    @app.post("/ui/book")
+    def ui_book(
+        name: str = Form(...),
+        city: str = Form(...),
+        date: str = Form(...),
+        time: str = Form(...),
+        party_size: int = Form(...)
+    ):
+        # Reuse your existing BookingRequest model and /book logic
+        req = BookingRequest(
+            name=name,
+            city=city,
+            date=date,
+            time=time,
+            party_size=party_size
+        )
+    
+        result = book(req)
+        booking_id = result["booking_id"]
+    
+        # Send user to the status page
+        return RedirectResponse(url=f"/ui/status/{booking_id}", status_code=303)
+
+    @app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <html>
+        <head>
+            <title>Tabel</title>
+        </head>
+        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto;">
+            <h1>Tabel</h1>
+            <p>I will try get you a table. Fast. No lies.</p>
+
+            <form action="/ui/book" method="post">
+                <label>Name</label><br>
+                <input name="name" required style="width: 100%; padding: 8px;"><br><br>
+
+                <label>City</label><br>
+                <input name="city" required style="width: 100%; padding: 8px;"><br><br>
+
+                <label>Date</label><br>
+                <input type="date" name="date" required style="width: 100%; padding: 8px;"><br><br>
+
+                <label>Time</label><br>
+                <input type="time" name="time" required style="width: 100%; padding: 8px;"><br><br>
+
+                <label>Party size</label><br>
+                <input type="number" name="party_size" min="1" required style="width: 100%; padding: 8px;"><br><br>
+
+                <button type="submit" style="padding: 10px 16px;">Get me a table</button>
+            </form>
+
+            <hr style="margin: 30px 0;">
+            <p><small>Developer tools: <a href="/docs">Swagger</a></small></p>
+        </body>
+    </html>
+    """
+    
+    @app.get("/ui/status/{booking_id}", response_class=HTMLResponse)
+    def ui_status(booking_id: str):
+        data = timeline(booking_id)   # reuse your /timeline endpoint
+        status_text = data.get("status", "unknown")
+        steps = data.get("timeline", [])
+    
+        html = f"""
+        <html>
+            <head>
+                <title>Booking Status</title>
+            </head>
+            <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto;">
+                <h1>Booking Status</h1>
+                <p><strong>Status:</strong> {status_text}</p>
+    
+                <h2>Progress</h2>
+                <ul>
+        """
+    
+        if not steps:
+            html += "<li>No events yet. Refresh in a few seconds.</li>"
+        else:
+            for item in steps:
+                html += f"<li>{item['step']} <br><small>{item['time']}</small></li>"
+    
+        html += f"""
+                </ul>
+    
+                <p><button onclick="location.reload()">Refresh</button></p>
+    
+                <hr style="margin: 30px 0;">
+                <p><small>Booking ID: {booking_id}</small></p>
+            </body>
+        </html>
+        """
+        return html
+
+
+    
+
