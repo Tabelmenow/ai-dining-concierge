@@ -5,11 +5,12 @@ import uuid
 import os
 from twilio.rest import Client
 from supabase import create_client
-from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
+from datetime import datetime, timezone, timedelta
 
 
 app = FastAPI()
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
@@ -19,8 +20,19 @@ else:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
+# -----------------------------
+# Step 4: Retry + timeout config
+# -----------------------------
+MAX_CALL_ATTEMPTS = 2          # never call more than this per booking
+CALL_COOLDOWN_MINUTES = 10     # minimum minutes between calls
+BOOKING_TIMEOUT_MINUTES = 60   # booking expires if not confirmed within this time
+
+
 def ai_suggest_strategy(booking: dict) -> dict:
-    """AI suggestion only. Does NOT confirm availability."""
+    """
+    AI suggestion only.
+    This does NOT confirm availability.
+    """
     return {
         "recommended_action": "try_digital_first",
         "reason": "Smaller party sizes are more likely to succeed digitally; call only if digital fails.",
@@ -28,12 +40,53 @@ def ai_suggest_strategy(booking: dict) -> dict:
     }
 
 
-def now_iso():
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def parse_iso(dt_str: str) -> datetime:
+    # Handles "+00:00" ISO strings and also "Z"
+    return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+
+
+def compute_expires_at(created_at_iso: str) -> str:
+    created = parse_iso(created_at_iso)
+    return (created + timedelta(minutes=BOOKING_TIMEOUT_MINUTES)).isoformat()
+
+
+def is_expired(booking_data: dict) -> bool:
+    expires_at = booking_data.get("expires_at")
+    if not expires_at:
+        return False
+    return datetime.now(timezone.utc) >= parse_iso(expires_at)
+
+
+def minutes_since(iso_time: str) -> float:
+    t = parse_iso(iso_time)
+    diff = datetime.now(timezone.utc) - t
+    return diff.total_seconds() / 60.0
+
+
+def can_call_again(booking_data: dict) -> tuple[bool, str]:
+    attempts = booking_data.get("call_attempts", 0)
+    if attempts >= MAX_CALL_ATTEMPTS:
+        return False, f"Max call attempts reached ({MAX_CALL_ATTEMPTS})"
+
+    last_call_at = booking_data.get("last_call_at")
+    if last_call_at:
+        mins = minutes_since(last_call_at)
+        if mins < CALL_COOLDOWN_MINUTES:
+            wait = int(CALL_COOLDOWN_MINUTES - mins)
+            return False, f"Cooldown active. Try again in ~{wait} minutes."
+
+    return True, "OK"
+
+
 def log_event(booking_data: dict, event_type: str, details: dict | None = None) -> None:
-    """Append-only event log. Never delete events."""
+    """
+    Append-only event log. Never delete events.
+    Keeps an audit trail of what happened.
+    """
     if "events" not in booking_data or booking_data["events"] is None:
         booking_data["events"] = []
 
@@ -47,8 +100,12 @@ def log_event(booking_data: dict, event_type: str, details: dict | None = None) 
 
 
 def try_digital_booking(booking: dict) -> dict:
-    """Simulates a digital booking attempt. Does NOT confirm availability."""
+    """
+    Simulates a digital booking attempt.
+    Does NOT confirm availability.
+    """
     party_size = booking["party_size"]
+
     if party_size <= 4:
         return {"success": False, "reason": "No digital availability found"}
     else:
@@ -56,18 +113,56 @@ def try_digital_booking(booking: dict) -> dict:
 
 
 def should_call_restaurant(context: dict) -> bool:
-    """Deterministic decision: should we allow a call step? Uses rules."""
+    """
+    Deterministic decision: should we allow a call step?
+    Uses rules, not AI guesses.
+    """
     if context["digital_attempt"]["success"] is True:
         return False
+
     if context["strategy"]["recommended_action"] != "try_digital_first":
         return False
+
     if context["request"]["party_size"] > 8:
         return False
+
     return True
 
 
+# -----------------------------
+# Twilio: test call (Founder only)
+# -----------------------------
+def make_test_call() -> str:
+    """
+    Makes a test call to the founder's verified phone number.
+    Testing only (not calling restaurants yet).
+    """
+    required_vars = ["TWILIO_SID", "TWILIO_AUTH", "TWILIO_NUMBER", "FOUNDER_PHONE"]
+    missing = [v for v in required_vars if not os.environ.get(v)]
+    if missing:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Missing environment variables: {', '.join(missing)}"
+        )
+
+    client = Client(os.environ["TWILIO_SID"], os.environ["TWILIO_AUTH"])
+
+    call = client.calls.create(
+        to=os.environ["FOUNDER_PHONE"],
+        from_=os.environ["TWILIO_NUMBER"],
+        url="http://demo.twilio.com/docs/voice.xml"
+    )
+
+    return call.sid
+
+
+# -----------------------------
+# Step 3: Polite deterministic call script
+# -----------------------------
 def compute_time_window(time_str: str, window_minutes: int):
-    """Given '19:00' and 30 minutes -> earliest '18:30', latest '19:30'."""
+    """
+    Given '19:00' and 30 minutes, returns: earliest '18:30', latest '19:30'
+    """
     t = datetime.strptime(time_str, "%H:%M")
     earliest = (t - timedelta(minutes=window_minutes)).strftime("%H:%M")
     latest = (t + timedelta(minutes=window_minutes)).strftime("%H:%M")
@@ -75,7 +170,10 @@ def compute_time_window(time_str: str, window_minutes: int):
 
 
 def build_call_script(booking_data: dict, restaurant_name: str = "the restaurant") -> dict:
-    """Deterministic script. No AI. No claims of availability."""
+    """
+    Deterministic script. No AI. No claims of availability.
+    Returns a script object you can display and log.
+    """
     req = booking_data["request"]
     name = req["name"]
     party = req["party_size"]
@@ -112,23 +210,6 @@ def build_call_script(booking_data: dict, restaurant_name: str = "the restaurant
     }
 
 
-def make_test_call() -> str:
-    """Calls the founder's verified phone number (test only)."""
-    required_vars = ["TWILIO_SID", "TWILIO_AUTH", "TWILIO_NUMBER", "FOUNDER_PHONE"]
-    missing = [v for v in required_vars if not os.environ.get(v)]
-    if missing:
-        raise HTTPException(status_code=500, detail=f"Missing environment variables: {', '.join(missing)}")
-
-    client = Client(os.environ["TWILIO_SID"], os.environ["TWILIO_AUTH"])
-
-    call = client.calls.create(
-        to=os.environ["FOUNDER_PHONE"],
-        from_=os.environ["TWILIO_NUMBER"],
-        url="http://demo.twilio.com/docs/voice.xml"
-    )
-    return call.sid
-
-
 class BookingRequest(BaseModel):
     name: str
     city: str
@@ -139,8 +220,14 @@ class BookingRequest(BaseModel):
     notes: str = ""
 
 
+# -----------------------------
+# Core API
+# -----------------------------
 @app.post("/book")
 def book(req: BookingRequest):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+
     booking_id = str(uuid.uuid4())
 
     try:
@@ -168,16 +255,22 @@ def book(req: BookingRequest):
         "call_outcome": None,
         "confirmation": None,
         "created_at": now_iso(),
-        "last_updated_at": now_iso()
+        "last_updated_at": now_iso(),
+
+        # Step 4 fields
+        "call_attempts": 0,
+        "last_call_at": None,
+        "expires_at": None,
+        "final_reason": None
     }
+
+    booking_data["expires_at"] = compute_expires_at(booking_data["created_at"])
+    log_event(booking_data, "timeout_set", {"expires_at": booking_data["expires_at"]})
 
     log_event(booking_data, "booking_created", {"city": req_data["city"], "party_size": req_data["party_size"]})
     log_event(booking_data, "strategy_suggested", strategy)
     log_event(booking_data, "digital_attempted", digital_result)
     log_event(booking_data, "call_decision_made", {"call_allowed": call_allowed})
-
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
 
     supabase.table("bookings").insert({"id": booking_id, "data": booking_data}).execute()
 
@@ -187,7 +280,8 @@ def book(req: BookingRequest):
         "strategy": booking_data["strategy"],
         "digital_attempt": booking_data["digital_attempt"],
         "created_at": booking_data["created_at"],
-        "call_allowed": booking_data["call_allowed"]
+        "call_allowed": booking_data["call_allowed"],
+        "expires_at": booking_data["expires_at"]
     }
 
 
@@ -203,22 +297,6 @@ def status(booking_id: str):
     return result.data[0]["data"]
 
 
-@app.get("/debug/env")
-def debug_env():
-    supa_url = os.environ.get("SUPABASE_URL", "")
-    parsed = urlparse(supa_url) if supa_url else None
-
-    return {
-        "SUPABASE_URL_set": bool(supa_url),
-        "SUPABASE_URL_scheme": parsed.scheme if parsed else None,
-        "SUPABASE_URL_netloc": parsed.netloc if parsed else None,
-        "SUPABASE_KEY_set": bool(os.environ.get("SUPABASE_KEY")),
-        "TWILIO_SID_set": bool(os.environ.get("TWILIO_SID")),
-        "TWILIO_NUMBER_set": bool(os.environ.get("TWILIO_NUMBER")),
-        "FOUNDER_PHONE_set": bool(os.environ.get("FOUNDER_PHONE")),
-    }
-
-
 @app.post("/call-test/{booking_id}")
 def call_test(booking_id: str):
     if not supabase:
@@ -230,172 +308,52 @@ def call_test(booking_id: str):
 
     booking_data = result.data[0]["data"]
 
+    # Basic guardrails
     if booking_data.get("status") != "pending":
         raise HTTPException(status_code=400, detail=f"Cannot call because status is '{booking_data.get('status')}'")
+
     if booking_data.get("call_allowed") is not True:
         raise HTTPException(status_code=400, detail="Call not allowed for this booking (call_allowed is false)")
-    if booking_data.get("call") and booking_data["call"].get("call_sid"):
-        raise HTTPException(status_code=400, detail="Call already recorded for this booking")
 
+    # Step 4: expiry
+    if is_expired(booking_data):
+        booking_data["status"] = "expired"
+        booking_data["final_reason"] = "Timed out before confirmation"
+        log_event(booking_data, "booking_expired", {"reason": booking_data["final_reason"]})
+        supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
+        raise HTTPException(status_code=400, detail="Booking has expired (timeout)")
+
+    # Step 4: max attempts + cooldown
+    ok, msg = can_call_again(booking_data)
+    if not ok:
+        raise HTTPException(status_code=400, detail=msg)
+
+    # Step 3: generate script + log it (safe + deterministic)
     script = build_call_script(booking_data, restaurant_name="TEST")
     log_event(booking_data, "call_script_generated", {"script": script})
-    log_event(booking_data, "call_initiated", {"mode": "twilio"})
 
+    # Step 4: increment counters BEFORE calling Twilio
+    booking_data["call_attempts"] = booking_data.get("call_attempts", 0) + 1
+    booking_data["last_call_at"] = now_iso()
+    log_event(booking_data, "call_attempt_incremented", {
+        "call_attempts": booking_data["call_attempts"],
+        "last_call_at": booking_data["last_call_at"]
+    })
+
+    # Place Twilio call
+    log_event(booking_data, "call_initiated", {"mode": "twilio"})
     sid = make_test_call()
 
-    booking_data["call"] = {"call_sid": sid, "called_at": now_iso(), "to": "FOUNDER_PHONE"}
+    booking_data["call"] = {
+        "call_sid": sid,
+        "called_at": now_iso(),
+        "to": "FOUNDER_PHONE"
+    }
     log_event(booking_data, "call_recorded", {"call_sid": sid})
 
     supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
 
     return {"message": "Call placed and recorded", "call_sid": sid}
-
-
-@app.post("/confirm/{booking_id}")
-def confirm_booking(
-    booking_id: str,
-    proof: str = Query(..., min_length=10),
-    confirmed_by: str = Query(..., min_length=2),
-    method: str = Query(..., pattern="^(phone|digital|in_person)$")
-):
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-
-    result = supabase.table("bookings").select("data").eq("id", booking_id).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Booking not found")
-
-    booking_data = result.data[0]["data"]
-
-    if booking_data.get("status") == "confirmed":
-        return {"message": "Already confirmed", "confirmation": booking_data.get("confirmation")}
-
-    if booking_data.get("status") != "pending":
-        raise HTTPException(status_code=400, detail=f"Cannot confirm because status is '{booking_data.get('status')}'")
-
-    if method == "phone":
-        call_obj = booking_data.get("call") or {}
-        if not call_obj.get("call_sid"):
-            raise HTTPException(status_code=400, detail="Cannot confirm by phone without a recorded call SID")
-
-        outcome_obj = booking_data.get("call_outcome") or {}
-        if outcome_obj.get("outcome") != "CONFIRMED":
-            raise HTTPException(status_code=400, detail="Cannot confirm by phone unless call outcome is CONFIRMED")
-
-    booking_data["status"] = "confirmed"
-    booking_data["confirmation"] = {
-        "proof": proof,
-        "confirmed_by": confirmed_by,
-        "method": method,
-        "confirmed_at": now_iso()
-    }
-    log_event(booking_data, "confirmation_recorded", {"method": method, "confirmed_by": confirmed_by})
-
-    supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
-    return {"message": "Confirmed", "booking_id": booking_id}
-
-
-@app.get("/timeline/{booking_id}")
-def timeline(booking_id: str):
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-
-    result = supabase.table("bookings").select("data").eq("id", booking_id).execute()
-    if not result.data:
-        raise HTTPException(status_code=404, detail="Booking not found")
-
-    booking_data = result.data[0]["data"]
-    events = booking_data.get("events", [])
-
-    tl = []
-    for event in events:
-        if event["type"] == "booking_created":
-            tl.append({"step": "Request received", "time": event["time"]})
-        elif event["type"] == "digital_attempted":
-            tl.append({"step": "Searching digitally", "time": event["time"]})
-        elif event["type"] == "call_initiated":
-            tl.append({"step": "Calling restaurant to confirm", "time": event["time"]})
-        elif event["type"] == "call_recorded":
-            tl.append({"step": "Spoke to restaurant", "time": event["time"]})
-        elif event["type"] == "confirmation_recorded":
-            tl.append({"step": "Booking confirmed", "time": event["time"]})
-
-    return {"booking_id": booking_id, "status": booking_data.get("status"), "timeline": tl}
-
-
-@app.post("/ui/book")
-def ui_book(
-    name: str = Form(...),
-    city: str = Form(...),
-    date: str = Form(...),
-    time: str = Form(...),
-    party_size: int = Form(...),
-):
-    req = BookingRequest(name=name, city=city, date=date, time=time, party_size=party_size)
-    result = book(req)
-    booking_id = result["booking_id"]
-    return RedirectResponse(url=f"/ui/status/{booking_id}", status_code=303)
-
-
-@app.get("/", response_class=HTMLResponse)
-def home():
-    return """
-    <html>
-        <head><title>Tabel</title></head>
-        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto;">
-            <h1>Tabel</h1>
-            <p>I will try get you a table. Fast. No lies.</p>
-            <form action="/ui/book" method="post">
-                <label>Name</label><br>
-                <input name="name" required style="width: 100%; padding: 8px;"><br><br>
-                <label>City</label><br>
-                <input name="city" required style="width: 100%; padding: 8px;"><br><br>
-                <label>Date</label><br>
-                <input type="date" name="date" required style="width: 100%; padding: 8px;"><br><br>
-                <label>Time</label><br>
-                <input type="time" name="time" required style="width: 100%; padding: 8px;"><br><br>
-                <label>Party size</label><br>
-                <input type="number" name="party_size" min="1" required style="width: 100%; padding: 8px;"><br><br>
-                <button type="submit" style="padding: 10px 16px;">Get me a table</button>
-            </form>
-            <hr style="margin: 30px 0;">
-            <p><small>Developer tools: <a href="/docs">Swagger</a></small></p>
-        </body>
-    </html>
-    """
-
-
-@app.get("/ui/status/{booking_id}", response_class=HTMLResponse)
-def ui_status(booking_id: str):
-    data = timeline(booking_id)
-    status_text = data.get("status", "unknown")
-    steps = data.get("timeline", [])
-
-    html = f"""
-    <html>
-        <head><title>Booking Status</title></head>
-        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto;">
-            <h1>Booking Status</h1>
-            <p><strong>Status:</strong> {status_text}</p>
-            <h2>Progress</h2>
-            <ul>
-    """
-
-    if not steps:
-        html += "<li>No events yet. Refresh in a few seconds.</li>"
-    else:
-        for item in steps:
-            html += f"<li>{item['step']} <br><small>{item['time']}</small></li>"
-
-    html += f"""
-            </ul>
-            <p><button onclick="location.reload()">Refresh</button></p>
-            <hr style="margin: 30px 0;">
-            <p><small>Booking ID: {booking_id}</small></p>
-        </body>
-    </html>
-    """
-    return html
 
 
 @app.get("/call-script/{booking_id}")
@@ -429,6 +387,10 @@ def call_outcome(
 
     booking_data = result.data[0]["data"]
 
+    # Don’t allow outcomes on finished bookings
+    if booking_data.get("status") in ("confirmed", "failed", "expired"):
+        raise HTTPException(status_code=400, detail=f"Cannot record outcome because status is '{booking_data.get('status')}'")
+
     booking_data["call_outcome"] = {
         "outcome": outcome,
         "notes": notes,
@@ -438,8 +400,279 @@ def call_outcome(
     }
     log_event(booking_data, "call_outcome_recorded", booking_data["call_outcome"])
 
+    # Step 4: behaviour rules after outcome
+    if outcome == "CONFIRMED":
+        booking_data["status"] = "awaiting_confirmation"  # user must still run /confirm with proof
+        log_event(booking_data, "status_changed", {"status": booking_data["status"]})
+
+    elif outcome == "DECLINED":
+        booking_data["status"] = "failed"
+        booking_data["final_reason"] = "Restaurant declined the booking request"
+        log_event(booking_data, "booking_failed", {"reason": booking_data["final_reason"]})
+
+    elif outcome == "NO_ANSWER":
+        # stays pending, cooldown + max attempts will control future calls
+        log_event(booking_data, "retry_possible", {"reason": "No answer"})
+
+    elif outcome == "OFFERED_ALTERNATIVE":
+        booking_data["status"] = "needs_user_decision"
+        log_event(booking_data, "status_changed", {"status": booking_data["status"]})
+
     supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
-    return {"message": "Call outcome saved", "booking_id": booking_id, "outcome": outcome}
+    return {"message": "Call outcome saved", "booking_id": booking_id, "outcome": outcome, "status": booking_data.get("status")}
 
 
+@app.post("/confirm/{booking_id}")
+def confirm_booking(
+    booking_id: str,
+    proof: str = Query(..., min_length=10, description="Human-verifiable proof text"),
+    confirmed_by: str = Query(..., min_length=2, description="Who confirmed it"),
+    method: str = Query(..., pattern="^(phone|digital|in_person)$", description="How it was verified")
+):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
 
+    result = supabase.table("bookings").select("data").eq("id", booking_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    booking_data = result.data[0]["data"]
+
+    if booking_data.get("status") == "confirmed":
+        return {"message": "Already confirmed", "confirmation": booking_data.get("confirmation")}
+
+    # Step 4: block if expired
+    if is_expired(booking_data):
+        booking_data["status"] = "expired"
+        booking_data["final_reason"] = "Timed out before confirmation"
+        log_event(booking_data, "booking_expired", {"reason": booking_data["final_reason"]})
+        supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
+        raise HTTPException(status_code=400, detail="Booking has expired (timeout)")
+
+    # Allow confirming from pending OR awaiting_confirmation
+    if booking_data.get("status") not in ("pending", "awaiting_confirmation"):
+        raise HTTPException(status_code=400, detail=f"Cannot confirm because status is '{booking_data.get('status')}'")
+
+    # Phone confirmations require call_sid + call_outcome CONFIRMED
+    if method == "phone":
+        call_obj = booking_data.get("call") or {}
+        if not call_obj.get("call_sid"):
+            raise HTTPException(status_code=400, detail="Cannot confirm by phone without a recorded call SID")
+
+        outcome_obj = booking_data.get("call_outcome") or {}
+        if outcome_obj.get("outcome") != "CONFIRMED":
+            raise HTTPException(status_code=400, detail="Cannot confirm by phone unless call outcome is CONFIRMED")
+
+    booking_data["status"] = "confirmed"
+    booking_data["confirmation"] = {
+        "proof": proof,
+        "confirmed_by": confirmed_by,
+        "method": method,
+        "confirmed_at": now_iso()
+    }
+    log_event(booking_data, "confirmation_recorded", {"method": method, "confirmed_by": confirmed_by})
+
+    supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
+    return {"message": "Confirmed", "booking_id": booking_id, "status": booking_data["status"]}
+
+
+@app.post("/advance/{booking_id}")
+def advance(booking_id: str):
+    """
+    Optional helper: lets UI or you "tick" the booking forward (mainly: expire it if timed out).
+    """
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+
+    result = supabase.table("bookings").select("data").eq("id", booking_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    booking_data = result.data[0]["data"]
+
+    if booking_data.get("status") in ("confirmed", "failed", "expired"):
+        return {"message": "No change", "status": booking_data.get("status")}
+
+    if is_expired(booking_data):
+        booking_data["status"] = "expired"
+        booking_data["final_reason"] = "Timed out before confirmation"
+        log_event(booking_data, "booking_expired", {"reason": booking_data["final_reason"]})
+        supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
+        return {"message": "Expired", "status": booking_data["status"]}
+
+    return {"message": "Still active", "status": booking_data.get("status"), "expires_at": booking_data.get("expires_at")}
+
+
+@app.get("/timeline/{booking_id}")
+def timeline(booking_id: str):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+
+    result = supabase.table("bookings").select("data").eq("id", booking_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    booking_data = result.data[0]["data"]
+    events = booking_data.get("events", [])
+
+    timeline_steps = []
+    for event in events:
+        t = event.get("time")
+        et = event.get("type")
+
+        if et == "booking_created":
+            timeline_steps.append({"step": "Request received", "time": t})
+        elif et == "digital_attempted":
+            timeline_steps.append({"step": "Searching digitally", "time": t})
+        elif et == "call_script_generated":
+            timeline_steps.append({"step": "Preparing call script", "time": t})
+        elif et == "call_initiated":
+            timeline_steps.append({"step": "Calling to check availability", "time": t})
+        elif et == "call_recorded":
+            timeline_steps.append({"step": "Call connected (SID recorded)", "time": t})
+        elif et == "call_outcome_recorded":
+            outcome = (event.get("details") or {}).get("outcome", "unknown")
+            timeline_steps.append({"step": f"Call outcome recorded: {outcome}", "time": t})
+        elif et == "confirmation_recorded":
+            timeline_steps.append({"step": "Booking confirmed", "time": t})
+        elif et == "booking_failed":
+            timeline_steps.append({"step": "Booking failed", "time": t})
+        elif et == "booking_expired":
+            timeline_steps.append({"step": "Booking expired (timeout)", "time": t})
+
+    return {
+        "booking_id": booking_id,
+        "status": booking_data.get("status"),
+        "expires_at": booking_data.get("expires_at"),
+        "timeline": timeline_steps
+    }
+
+
+# -----------------------------
+# Debug + Simple UI
+# -----------------------------
+@app.get("/debug/env")
+def debug_env():
+    supa_url = os.environ.get("SUPABASE_URL", "")
+    parsed = urlparse(supa_url) if supa_url else None
+
+    return {
+        "SUPABASE_URL_set": bool(supa_url),
+        "SUPABASE_URL_scheme": parsed.scheme if parsed else None,
+        "SUPABASE_URL_netloc": parsed.netloc if parsed else None,
+        "SUPABASE_KEY_set": bool(os.environ.get("SUPABASE_KEY")),
+        "TWILIO_SID_set": bool(os.environ.get("TWILIO_SID")),
+        "TWILIO_NUMBER_set": bool(os.environ.get("TWILIO_NUMBER")),
+        "FOUNDER_PHONE_set": bool(os.environ.get("FOUNDER_PHONE")),
+    }
+
+
+@app.post("/ui/book")
+def ui_book(
+    name: str = Form(...),
+    city: str = Form(...),
+    date: str = Form(...),
+    time: str = Form(...),
+    party_size: int = Form(...),
+    time_window_minutes: int = Form(30),
+    notes: str = Form("")
+):
+    req = BookingRequest(
+        name=name,
+        city=city,
+        date=date,
+        time=time,
+        party_size=party_size,
+        time_window_minutes=time_window_minutes,
+        notes=notes
+    )
+
+    result = book(req)
+    booking_id = result["booking_id"]
+    return RedirectResponse(url=f"/ui/status/{booking_id}", status_code=303)
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <html>
+        <head>
+            <title>Tabel</title>
+        </head>
+        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto;">
+            <h1>Tabel</h1>
+            <p>I will try get you a table. Fast. No lies.</p>
+
+            <form action="/ui/book" method="post">
+                <label>Name</label><br>
+                <input name="name" required style="width: 100%; padding: 8px;"><br><br>
+
+                <label>City</label><br>
+                <input name="city" required style="width: 100%; padding: 8px;"><br><br>
+
+                <label>Date</label><br>
+                <input type="date" name="date" required style="width: 100%; padding: 8px;"><br><br>
+
+                <label>Time</label><br>
+                <input type="time" name="time" required style="width: 100%; padding: 8px;"><br><br>
+
+                <label>Party size</label><br>
+                <input type="number" name="party_size" min="1" required style="width: 100%; padding: 8px;"><br><br>
+
+                <label>Flex window (minutes)</label><br>
+                <input type="number" name="time_window_minutes" min="0" value="30" style="width: 100%; padding: 8px;"><br><br>
+
+                <label>Notes (optional)</label><br>
+                <input name="notes" style="width: 100%; padding: 8px;"><br><br>
+
+                <button type="submit" style="padding: 10px 16px;">Get me a table</button>
+            </form>
+
+            <hr style="margin: 30px 0;">
+            <p><small>Developer tools: <a href="/docs">Swagger</a></small></p>
+        </body>
+    </html>
+    """
+
+
+@app.get("/ui/status/{booking_id}", response_class=HTMLResponse)
+def ui_status(booking_id: str):
+    data = timeline(booking_id)
+    status_text = data.get("status", "unknown")
+    steps = data.get("timeline", [])
+    expires_at = data.get("expires_at", "")
+
+    html = f"""
+    <html>
+        <head>
+            <title>Booking Status</title>
+        </head>
+        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto;">
+            <h1>Booking Status</h1>
+            <p><strong>Status:</strong> {status_text}</p>
+            <p><strong>Expires at (UTC):</strong> {expires_at}</p>
+
+            <h2>Progress</h2>
+            <ul>
+    """
+
+    if not steps:
+        html += "<li>No events yet. Refresh in a few seconds.</li>"
+    else:
+        for item in steps:
+            html += f"<li>{item['step']}<br><small>{item['time']}</small></li>"
+
+    html += f"""
+            </ul>
+
+            <p>
+                <button onclick="location.reload()">Refresh</button>
+            </p>
+
+            <hr style="margin: 30px 0;">
+            <p><small>Booking ID: {booking_id}</small></p>
+            <p><small><a href="/docs">Swagger</a></small></p>
+        </body>
+    </html>
+    """
+    return html
