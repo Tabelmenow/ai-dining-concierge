@@ -1,6 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 twilio
 supabase
-python-multipart==0.0.9
-
+python-multipart
