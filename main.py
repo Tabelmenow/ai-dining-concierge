@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 import uuid
 import os
+import re
 from twilio.rest import Client
 from supabase import create_client
 from urllib.parse import urlparse
@@ -26,6 +27,13 @@ else:
 MAX_CALL_ATTEMPTS = 2          # never call more than this per booking
 CALL_COOLDOWN_MINUTES = 10     # minimum minutes between calls
 BOOKING_TIMEOUT_MINUTES = 60   # booking expires if not confirmed within this time
+
+
+# -----------------------------
+# Step 5: Safe switch for real restaurant calling
+# Default: False (still calls founder)
+# -----------------------------
+ALLOW_REAL_RESTAURANT_CALLS = os.environ.get("ALLOW_REAL_RESTAURANT_CALLS", "false").lower() == "true"
 
 
 def ai_suggest_strategy(booking: dict) -> dict:
@@ -129,15 +137,24 @@ def should_call_restaurant(context: dict) -> bool:
     return True
 
 
-# -----------------------------
-# Twilio: test call (Founder only)
-# -----------------------------
-def make_test_call() -> str:
+def is_valid_phone_e164(phone: str) -> bool:
     """
-    Makes a test call to the founder's verified phone number.
-    Testing only (not calling restaurants yet).
+    Minimal E.164 check: + and 8-15 digits.
+    Example: +64211234567
     """
-    required_vars = ["TWILIO_SID", "TWILIO_AUTH", "TWILIO_NUMBER", "FOUNDER_PHONE"]
+    if not phone:
+        return False
+    return bool(re.fullmatch(r"\+[1-9]\d{7,14}", phone.strip()))
+
+
+# -----------------------------
+# Twilio: safe calling
+# -----------------------------
+def make_call(to_number: str) -> str:
+    """
+    Makes a Twilio call to a number (E.164).
+    """
+    required_vars = ["TWILIO_SID", "TWILIO_AUTH", "TWILIO_NUMBER"]
     missing = [v for v in required_vars if not os.environ.get(v)]
     if missing:
         raise HTTPException(
@@ -145,15 +162,46 @@ def make_test_call() -> str:
             detail=f"Missing environment variables: {', '.join(missing)}"
         )
 
+    if not is_valid_phone_e164(to_number):
+        raise HTTPException(status_code=400, detail="Invalid phone number format. Use E.164 like +6421...")
+
     client = Client(os.environ["TWILIO_SID"], os.environ["TWILIO_AUTH"])
 
     call = client.calls.create(
-        to=os.environ["FOUNDER_PHONE"],
+        to=to_number,
         from_=os.environ["TWILIO_NUMBER"],
         url="http://demo.twilio.com/docs/voice.xml"
     )
 
     return call.sid
+
+
+def make_test_call() -> str:
+    """
+    Founder-only test call (unchanged behaviour).
+    """
+    founder = os.environ.get("FOUNDER_PHONE")
+    if not founder:
+        raise HTTPException(status_code=500, detail="Missing environment variable: FOUNDER_PHONE")
+    return make_call(founder)
+
+
+def resolve_call_destination(booking_data: dict) -> tuple[str, str]:
+    """
+    Returns (to_number, mode_string)
+    - By default: founder (safe)
+    - If ALLOW_REAL_RESTAURANT_CALLS=true AND restaurant_phone present/valid: restaurant
+    """
+    req = booking_data.get("request") or {}
+    restaurant_phone = (req.get("restaurant_phone") or "").strip()
+
+    if ALLOW_REAL_RESTAURANT_CALLS and is_valid_phone_e164(restaurant_phone):
+        return restaurant_phone, "restaurant"
+
+    founder = os.environ.get("FOUNDER_PHONE") or ""
+    if not founder:
+        raise HTTPException(status_code=500, detail="Missing environment variable: FOUNDER_PHONE")
+    return founder, "founder_safe_default"
 
 
 # -----------------------------
@@ -210,6 +258,42 @@ def build_call_script(booking_data: dict, restaurant_name: str = "the restaurant
     }
 
 
+def compute_next_action(booking_data: dict) -> str:
+    """
+    Human-friendly next action, used by /ui/status
+    """
+    status = booking_data.get("status", "unknown")
+    call_allowed = booking_data.get("call_allowed") is True
+    call_obj = booking_data.get("call") or {}
+    call_sid = call_obj.get("call_sid")
+    outcome_obj = booking_data.get("call_outcome") or {}
+    outcome = outcome_obj.get("outcome")
+
+    if status in ("confirmed", "failed", "expired"):
+        return "No further action needed."
+
+    if is_expired(booking_data):
+        return "This booking is expired. (You can create a new one.)"
+
+    if status == "needs_user_decision":
+        return "Restaurant offered an alternative. Record details and decide what to do next."
+
+    if status == "awaiting_confirmation":
+        return "Call outcome is CONFIRMED. Next: confirm the booking (with proof)."
+
+    # pending or unknown
+    if call_allowed and not call_sid:
+        return "Next: place a call (and read the call script)."
+
+    if call_sid and outcome != "CONFIRMED":
+        return "Next: record call outcome (NO_ANSWER / DECLINED / OFFERED_ALTERNATIVE / CONFIRMED)."
+
+    if call_sid and outcome == "CONFIRMED":
+        return "Next: confirm the booking (with proof)."
+
+    return "Next: review details and continue."
+
+
 class BookingRequest(BaseModel):
     name: str
     city: str
@@ -218,6 +302,10 @@ class BookingRequest(BaseModel):
     party_size: int
     time_window_minutes: int = 30
     notes: str = ""
+
+    # Step 3/5: restaurant details captured at request time (optional for now)
+    restaurant_name: str = ""
+    restaurant_phone: str = ""  # E.164 preferred: +64...
 
 
 # -----------------------------
@@ -328,8 +416,10 @@ def call_test(booking_id: str):
     if not ok:
         raise HTTPException(status_code=400, detail=msg)
 
-    # Step 3: generate script + log it (safe + deterministic)
-    script = build_call_script(booking_data, restaurant_name="TEST")
+    # Script: generate + log
+    req = booking_data.get("request") or {}
+    restaurant_name = (req.get("restaurant_name") or "the restaurant").strip() or "the restaurant"
+    script = build_call_script(booking_data, restaurant_name=restaurant_name)
     log_event(booking_data, "call_script_generated", {"script": script})
 
     # Step 4: increment counters BEFORE calling Twilio
@@ -340,20 +430,25 @@ def call_test(booking_id: str):
         "last_call_at": booking_data["last_call_at"]
     })
 
+    # Choose destination (safe by default)
+    to_number, mode = resolve_call_destination(booking_data)
+    log_event(booking_data, "call_destination_resolved", {"mode": mode, "to": to_number})
+
     # Place Twilio call
     log_event(booking_data, "call_initiated", {"mode": "twilio"})
-    sid = make_test_call()
+    sid = make_call(to_number)
 
     booking_data["call"] = {
         "call_sid": sid,
         "called_at": now_iso(),
-        "to": "FOUNDER_PHONE"
+        "to": to_number,
+        "to_mode": mode
     }
     log_event(booking_data, "call_recorded", {"call_sid": sid})
 
     supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
 
-    return {"message": "Call placed and recorded", "call_sid": sid}
+    return {"message": "Call placed and recorded", "call_sid": sid, "to_mode": mode}
 
 
 @app.get("/call-script/{booking_id}")
@@ -564,6 +659,7 @@ def debug_env():
         "TWILIO_SID_set": bool(os.environ.get("TWILIO_SID")),
         "TWILIO_NUMBER_set": bool(os.environ.get("TWILIO_NUMBER")),
         "FOUNDER_PHONE_set": bool(os.environ.get("FOUNDER_PHONE")),
+        "ALLOW_REAL_RESTAURANT_CALLS": ALLOW_REAL_RESTAURANT_CALLS,
     }
 
 
@@ -575,7 +671,9 @@ def ui_book(
     time: str = Form(...),
     party_size: int = Form(...),
     time_window_minutes: int = Form(30),
-    notes: str = Form("")
+    notes: str = Form(""),
+    restaurant_name: str = Form(""),
+    restaurant_phone: str = Form(""),
 ):
     req = BookingRequest(
         name=name,
@@ -584,7 +682,9 @@ def ui_book(
         time=time,
         party_size=party_size,
         time_window_minutes=time_window_minutes,
-        notes=notes
+        notes=notes,
+        restaurant_name=restaurant_name,
+        restaurant_phone=restaurant_phone,
     )
 
     result = book(req)
@@ -604,7 +704,16 @@ def home():
             <p>I will try get you a table. Fast. No lies.</p>
 
             <form action="/ui/book" method="post">
-                <label>Name</label><br>
+                <h3>Restaurant (optional for now)</h3>
+                <label>Restaurant name</label><br>
+                <input name="restaurant_name" style="width: 100%; padding: 8px;"><br><br>
+
+                <label>Restaurant phone (E.164, e.g. +64211234567)</label><br>
+                <input name="restaurant_phone" style="width: 100%; padding: 8px;"><br><br>
+
+                <hr style="margin: 20px 0;">
+
+                <label>Your name</label><br>
                 <input name="name" required style="width: 100%; padding: 8px;"><br><br>
 
                 <label>City</label><br>
@@ -637,20 +746,32 @@ def home():
 
 @app.get("/ui/status/{booking_id}", response_class=HTMLResponse)
 def ui_status(booking_id: str):
+    # load booking (so we can compute next action)
+    booking_data = status(booking_id)
     data = timeline(booking_id)
+
     status_text = data.get("status", "unknown")
     steps = data.get("timeline", [])
     expires_at = data.get("expires_at", "")
+    next_action = compute_next_action(booking_data)
 
     html = f"""
     <html>
         <head>
             <title>Booking Status</title>
         </head>
-        <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto;">
+        <body style="font-family: Arial, sans-serif; max-width: 700px; margin: 40px auto;">
             <h1>Booking Status</h1>
+
             <p><strong>Status:</strong> {status_text}</p>
+            <p><strong>Next action:</strong> {next_action}</p>
             <p><strong>Expires at (UTC):</strong> {expires_at}</p>
+
+            <p>
+                <a href="/call-script/{booking_id}" style="margin-right: 12px;">View call script</a>
+                <a href="/ui/call-outcome/{booking_id}" style="margin-right: 12px;">Record call outcome</a>
+                <a href="/docs" style="margin-right: 12px;">Confirm (via Swagger)</a>
+            </p>
 
             <h2>Progress</h2>
             <ul>
@@ -671,8 +792,76 @@ def ui_status(booking_id: str):
 
             <hr style="margin: 30px 0;">
             <p><small>Booking ID: {booking_id}</small></p>
-            <p><small><a href="/docs">Swagger</a></small></p>
+            <p><small><a href="/">New booking</a> | <a href="/docs">Swagger</a></small></p>
         </body>
     </html>
     """
     return html
+
+
+# -----------------------------
+# Step 6: Call outcome UI (no Swagger)
+# -----------------------------
+@app.get("/ui/call-outcome/{booking_id}", response_class=HTMLResponse)
+def ui_call_outcome_form(booking_id: str):
+    # will raise 404 if missing
+    booking_data = status(booking_id)
+    req = booking_data.get("request") or {}
+    rname = (req.get("restaurant_name") or "").strip() or "the restaurant"
+
+    return f"""
+    <html>
+        <head>
+            <title>Call Outcome</title>
+        </head>
+        <body style="font-family: Arial, sans-serif; max-width: 700px; margin: 40px auto;">
+            <h1>Record Call Outcome</h1>
+            <p><strong>Booking:</strong> {booking_id}</p>
+            <p><strong>Restaurant:</strong> {rname}</p>
+
+            <form action="/ui/call-outcome/{booking_id}" method="post">
+                <label>Outcome</label><br>
+                <select name="outcome" required style="width: 100%; padding: 8px;">
+                    <option value="NO_ANSWER">NO_ANSWER</option>
+                    <option value="DECLINED">DECLINED</option>
+                    <option value="OFFERED_ALTERNATIVE">OFFERED_ALTERNATIVE</option>
+                    <option value="CONFIRMED">CONFIRMED</option>
+                </select><br><br>
+
+                <label>Notes (optional)</label><br>
+                <input name="notes" style="width: 100%; padding: 8px;"><br><br>
+
+                <label>Confirmed time (only if CONFIRMED, e.g. 19:15)</label><br>
+                <input name="confirmed_time" style="width: 100%; padding: 8px;"><br><br>
+
+                <label>Reference (optional)</label><br>
+                <input name="reference" style="width: 100%; padding: 8px;"><br><br>
+
+                <button type="submit" style="padding: 10px 16px;">Save outcome</button>
+                <a href="/ui/status/{booking_id}" style="margin-left: 12px;">Cancel</a>
+            </form>
+
+            <hr style="margin: 30px 0;">
+            <p><small><a href="/ui/status/{booking_id}">Back to status</a></small></p>
+        </body>
+    </html>
+    """
+
+
+@app.post("/ui/call-outcome/{booking_id}")
+def ui_call_outcome_submit(
+    booking_id: str,
+    outcome: str = Form(...),
+    notes: str = Form(""),
+    confirmed_time: str = Form(""),
+    reference: str = Form(""),
+):
+    # Reuse the API logic (this will apply guardrails)
+    call_outcome(
+        booking_id=booking_id,
+        outcome=outcome,
+        notes=notes,
+        confirmed_time=confirmed_time,
+        reference=reference,
+    )
+    return RedirectResponse(url=f"/ui/status/{booking_id}", status_code=303)
