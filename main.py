@@ -1,31 +1,27 @@
-from fastapi import (
-    FastAPI,
-    HTTPException,
-    Query,
-    Form,
-    Header,
-    Depends
-)
-import httpx
-from fastapi import Request
-from fastapi.responses import JSONResponse
-
+from fastapi import FastAPI, HTTPException, Query, Form, Header, Depends, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
+import httpx
 import uuid
 import os
 import re
 import jwt
-from twilio.rest import Client
+import base64
+import hashlib
+import secrets
 from supabase import create_client
-from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
+from urllib.parse import quote
 
 
 app = FastAPI()
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+# =====================================================
+# Env + Supabase client
+# =====================================================
+SUPABASE_URL = os.environ.get("SUPABASE_URL")              # e.g. https://xxxx.supabase.co
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")              # service key (server)
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")    # anon key (browser auth flows)
 SUPABASE_JWT_SECRET = os.environ.get("SUPABASE_JWT_SECRET")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -33,55 +29,134 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 else:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+# Render base URL (single source of truth for redirects)
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "https://ai-dining-concierge.onrender.com").rstrip("/")
 
+# Cookie names
+COOKIE_PKCE_VERIFIER = "tabel_pkce_verifier"
+COOKIE_ACCESS_TOKEN = "tabel_access_token"
+
+
+# =====================================================
+# PKCE helpers
+# =====================================================
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
+
+def pkce_generate_verifier() -> str:
+    # 43-128 chars recommended; we use 64 bytes -> ~86 chars base64url
+    return _b64url(secrets.token_bytes(64))
+
+def pkce_challenge_from_verifier(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("utf-8")).digest()
+    return _b64url(digest)
+
+
+# =====================================================
+# Phase 3 · Step 1 — Supabase Auth (Identity)
+# Accepts Bearer header OR cookie set by /auth/callback
+# =====================================================
+def get_current_user_id(
+    request: Request,
+    authorization: str = Header(None),
+) -> str:
+    token = None
+
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.replace("Bearer ", "").strip()
+    else:
+        token = request.cookies.get(COOKIE_ACCESS_TOKEN)
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing auth token (login first)")
+
+    if not SUPABASE_JWT_SECRET:
+        raise HTTPException(status_code=500, detail="Missing SUPABASE_JWT_SECRET env var")
+
+    try:
+        payload = jwt.decode(
+            token,
+            SUPABASE_JWT_SECRET,
+            algorithms=["HS256"],
+            audience="authenticated",
+        )
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="User ID missing in token")
+
+    return user_id
+
+
+# =====================================================
+# OAuth UI + Flow (Google)
+# =====================================================
 @app.get("/ui/login", response_class=HTMLResponse)
 def ui_login_page():
-    # Simple page with a "Login with Google" button
-    return """
+    return f"""
     <html>
       <head><title>Tabel Login</title></head>
       <body style="font-family: Arial; max-width: 700px; margin: 40px auto;">
         <h1>Login</h1>
-        <p>Click to sign in with Google.</p>
+        <p>Step 1: Click the button.</p>
         <p><a href="/auth/google/start">Sign in with Google</a></p>
         <hr>
-        <p><small><a href="/">Home</a> | <a href="/docs">Swagger</a></small></p>
+        <p><small><a href="/">Home</a> | <a href="/ui/me">Who am I?</a> | <a href="/docs">Swagger</a></small></p>
       </body>
     </html>
     """
 
 
 @app.get("/auth/google/start")
-def auth_google_start():
+def auth_google_start(response: Response):
     """
-    Redirects the user to Supabase's Google OAuth flow.
-    Supabase will send them back to /auth/callback on this site.
+    1) Create a PKCE verifier (secret)
+    2) Compute PKCE challenge (public)
+    3) Store verifier in a cookie
+    4) Redirect browser to Supabase /authorize with challenge
     """
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
         raise HTTPException(status_code=500, detail="Missing SUPABASE_URL or SUPABASE_ANON_KEY")
 
-    redirect_to = "https://ai-dining-concierge.onrender.com/auth/callback"
+    verifier = pkce_generate_verifier()
+    challenge = pkce_challenge_from_verifier(verifier)
 
-    # This is the Supabase Auth URL that starts OAuth with Google
-    # Note: provider=google and redirect_to is where Supabase sends the user after login
+    redirect_to = f"{PUBLIC_BASE_URL}/auth/callback"
+    redirect_to_enc = quote(redirect_to, safe="")
+
+    # Supabase hosted auth endpoint (browser redirect)
     url = (
         f"{SUPABASE_URL}/auth/v1/authorize"
         f"?provider=google"
-        f"&redirect_to={redirect_to}"
+        f"&redirect_to={redirect_to_enc}"
+        f"&code_challenge={challenge}"
+        f"&code_challenge_method=s256"
     )
 
-    # Supabase expects the API key header; easiest is to redirect user to url and include key later is not possible in a redirect
-    # So we do the recommended method: use the "auth/v1/authorize" endpoint which works with browser redirects.
-    return RedirectResponse(url=url, status_code=302)
+    # Store verifier so callback can exchange code -> session
+    # secure=True is correct on HTTPS (Render). If testing locally, set SECURE_COOKIES=false and toggle.
+    secure_cookies = os.environ.get("SECURE_COOKIES", "true").lower() == "true"
+    resp = RedirectResponse(url=url, status_code=302)
+    resp.set_cookie(
+        key=COOKIE_PKCE_VERIFIER,
+        value=verifier,
+        httponly=True,
+        secure=secure_cookies,
+        samesite="lax",
+        max_age=10 * 60,  # 10 minutes
+        path="/",
+    )
+    return resp
 
 
 @app.get("/auth/callback", response_class=HTMLResponse)
 async def auth_callback(request: Request):
     """
-    Supabase redirects back here with a 'code' parameter.
-    We exchange that 'code' for a session (access token + user info).
-    Then we display the user's email as proof it worked.
+    Supabase redirects here with ?code=...
+    We read PKCE verifier from cookie and exchange code for a session.
+    Then we store access_token in an HttpOnly cookie for the UI.
     """
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
         raise HTTPException(status_code=500, detail="Missing SUPABASE_URL or SUPABASE_ANON_KEY")
@@ -104,12 +179,27 @@ async def auth_callback(request: Request):
         return """
         <html><body style="font-family: Arial; max-width: 700px; margin: 40px auto;">
           <h1>Missing code</h1>
-          <p>Supabase did not send a 'code'. This usually means redirect URLs are not configured correctly.</p>
+          <p>Supabase did not send a 'code'.</p>
+          <p>Most common causes:</p>
+          <ul>
+            <li>Redirect URLs not saved in Supabase Authentication → URL Configuration</li>
+            <li>Google Console redirect URI is wrong (must be https://PROJECT.supabase.co/auth/v1/callback)</li>
+            <li>PKCE setup is incomplete</li>
+          </ul>
           <p><a href="/ui/login">Try again</a></p>
         </body></html>
         """
 
-    # Exchange the code for a session using Supabase token endpoint
+    verifier = request.cookies.get(COOKIE_PKCE_VERIFIER)
+    if not verifier:
+        return """
+        <html><body style="font-family: Arial; max-width: 700px; margin: 40px auto;">
+          <h1>Missing PKCE verifier</h1>
+          <p>Your browser did not have the PKCE cookie.</p>
+          <p>Fix: start again from <a href="/ui/login">/ui/login</a> and do not open multiple tabs.</p>
+        </body></html>
+        """
+
     token_url = f"{SUPABASE_URL}/auth/v1/token?grant_type=pkce"
 
     async with httpx.AsyncClient(timeout=20) as client:
@@ -119,7 +209,10 @@ async def auth_callback(request: Request):
                 "apikey": SUPABASE_ANON_KEY,
                 "Content-Type": "application/json",
             },
-            json={"auth_code": code},
+            json={
+                "auth_code": code,
+                "code_verifier": verifier,
+            },
         )
 
     if resp.status_code >= 400:
@@ -133,11 +226,23 @@ async def auth_callback(request: Request):
         """
 
     data = resp.json()
+    access_token = data.get("access_token")
     user = (data.get("user") or {})
     email = user.get("email", "(no email returned)")
     provider = user.get("app_metadata", {}).get("provider", "unknown")
 
-    return f"""
+    if not access_token:
+        return f"""
+        <html><body style="font-family: Arial; max-width: 700px; margin: 40px auto;">
+          <h1>Login incomplete</h1>
+          <p>No access_token returned.</p>
+          <pre>{data}</pre>
+          <p><a href="/ui/login">Try again</a></p>
+        </body></html>
+        """
+
+    secure_cookies = os.environ.get("SECURE_COOKIES", "true").lower() == "true"
+    html = f"""
     <html>
       <head><title>Login success</title></head>
       <body style="font-family: Arial; max-width: 700px; margin: 40px auto;">
@@ -146,87 +251,58 @@ async def auth_callback(request: Request):
         <p><strong>Email:</strong> {email}</p>
         <p>This proves Google sign-in worked.</p>
         <hr>
-        <p><a href="/">Go home</a> | <a href="/ui/login">Login page</a></p>
+        <p><a href="/ui/me">Go to /ui/me</a> (shows your user_id)</p>
+        <p><a href="/docs">Swagger</a> (now works with cookie auth in UI endpoints)</p>
+        <p><a href="/">Home</a></p>
+      </body>
+    </html>
+    """
+
+    response = HTMLResponse(content=html)
+    # Save access token for UI usage
+    response.set_cookie(
+        key=COOKIE_ACCESS_TOKEN,
+        value=access_token,
+        httponly=True,
+        secure=secure_cookies,
+        samesite="lax",
+        max_age=60 * 60 * 24,  # 1 day
+        path="/",
+    )
+    # Clean up verifier cookie
+    response.delete_cookie(COOKIE_PKCE_VERIFIER, path="/")
+    return response
+
+
+@app.get("/ui/me", response_class=HTMLResponse)
+def ui_me(request: Request, user_id: str = Depends(get_current_user_id)):
+    return f"""
+    <html>
+      <head><title>Me</title></head>
+      <body style="font-family: Arial; max-width: 700px; margin: 40px auto;">
+        <h1>You are logged in</h1>
+        <p><strong>User ID:</strong> {user_id}</p>
+        <p><a href="/ui/login">Login page</a> | <a href="/docs">Swagger</a> | <a href="/">Home</a></p>
       </body>
     </html>
     """
 
 
 # =====================================================
-# Phase 3 · Step 1 — Supabase Auth (Identity)
-# =====================================================
-def get_current_user_id(
-    authorization: str = Header(None),
-) -> str:
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
-
-    token = authorization.replace("Bearer ", "").strip()
-
-    try:
-        payload = jwt.decode(
-            token,
-            SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="authenticated",
-        )
-    except Exception:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-
-    user_id = payload.get("sub")
-    if not user_id:
-        raise HTTPException(status_code=401, detail="User ID missing in token")
-
-    return user_id
-
-
-# =====================================================
-# Config
+# Config + Booking Helpers (kept minimal)
 # =====================================================
 MAX_CALL_ATTEMPTS = 2
 CALL_COOLDOWN_MINUTES = 10
 BOOKING_TIMEOUT_MINUTES = 60
-ALLOW_REAL_RESTAURANT_CALLS = os.environ.get(
-    "ALLOW_REAL_RESTAURANT_CALLS", "false"
-).lower() == "true"
 
-
-# =====================================================
-# Helpers
-# =====================================================
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
 
 def parse_iso(dt_str: str) -> datetime:
     return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
 
-
 def compute_expires_at(created_at_iso: str) -> str:
     return (parse_iso(created_at_iso) + timedelta(minutes=BOOKING_TIMEOUT_MINUTES)).isoformat()
-
-
-def is_expired(booking_data: dict) -> bool:
-    exp = booking_data.get("expires_at")
-    return bool(exp and datetime.now(timezone.utc) >= parse_iso(exp))
-
-
-def minutes_since(iso_time: str) -> float:
-    return (datetime.now(timezone.utc) - parse_iso(iso_time)).total_seconds() / 60
-
-
-def can_call_again(booking_data: dict):
-    if booking_data.get("call_attempts", 0) >= MAX_CALL_ATTEMPTS:
-        return False, "Max call attempts reached"
-
-    last = booking_data.get("last_call_at")
-    if last:
-        mins = minutes_since(last)
-        if mins < CALL_COOLDOWN_MINUTES:
-            return False, f"Cooldown active ({int(CALL_COOLDOWN_MINUTES - mins)} mins)"
-
-    return True, "OK"
-
 
 def log_event(booking_data: dict, event_type: str, details: dict | None = None):
     booking_data.setdefault("events", []).append({
@@ -236,10 +312,6 @@ def log_event(booking_data: dict, event_type: str, details: dict | None = None):
     })
     booking_data["last_updated_at"] = now_iso()
 
-
-# =====================================================
-# Booking Logic
-# =====================================================
 def ai_suggest_strategy(_):
     return {
         "recommended_action": "try_digital_first",
@@ -247,10 +319,8 @@ def ai_suggest_strategy(_):
         "confidence": "medium",
     }
 
-
 def try_digital_booking(req: dict):
     return {"success": False, "reason": "No digital availability"}
-
 
 def should_call_restaurant(ctx: dict) -> bool:
     return (
@@ -276,13 +346,10 @@ class BookingRequest(BaseModel):
 
 
 # =====================================================
-# Core API
+# Core API (protected)
 # =====================================================
 @app.post("/book")
-def book(
-    req: BookingRequest,
-    user_id: str = Depends(get_current_user_id),
-):
+def book(req: BookingRequest, user_id: str = Depends(get_current_user_id)):
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not configured")
 
@@ -304,30 +371,17 @@ def book(
         "strategy": strategy,
         "digital_attempt": digital,
         "call_allowed": call_allowed,
-        "call": None,
-        "call_outcome": None,
-        "confirmation": None,
-        "call_attempts": 0,
-        "last_call_at": None,
         "created_at": now_iso(),
         "expires_at": None,
-        "final_reason": None,
         "events": [],
     }
 
     booking_data["expires_at"] = compute_expires_at(booking_data["created_at"])
     log_event(booking_data, "booking_created")
 
-    supabase.table("bookings").insert({
-        "id": booking_id,
-        "data": booking_data
-    }).execute()
+    supabase.table("bookings").insert({"id": booking_id, "data": booking_data}).execute()
 
-    return {
-        "booking_id": booking_id,
-        "status": "pending",
-        "expires_at": booking_data["expires_at"],
-    }
+    return {"booking_id": booking_id, "status": "pending", "expires_at": booking_data["expires_at"]}
 
 
 def load_booking(booking_id: str, user_id: str) -> dict:
@@ -343,63 +397,36 @@ def load_booking(booking_id: str, user_id: str) -> dict:
 
 
 @app.get("/status/{booking_id}")
-def status(
-    booking_id: str,
-    user_id: str = Depends(get_current_user_id),
-):
+def status(booking_id: str, user_id: str = Depends(get_current_user_id)):
     return load_booking(booking_id, user_id)
 
 
 @app.get("/timeline/{booking_id}")
-def timeline(
-    booking_id: str,
-    user_id: str = Depends(get_current_user_id),
-):
+def timeline(booking_id: str, user_id: str = Depends(get_current_user_id)):
     booking = load_booking(booking_id, user_id)
     return {
-        "status": booking["status"],
-        "expires_at": booking["expires_at"],
+        "status": booking.get("status"),
+        "expires_at": booking.get("expires_at"),
         "timeline": booking.get("events", []),
     }
 
 
 # =====================================================
-# UI (unchanged, now identity-safe)
+# UI
 # =====================================================
-@app.post("/ui/book")
-def ui_book(
-    name: str = Form(...),
-    city: str = Form(...),
-    date: str = Form(...),
-    time: str = Form(...),
-    party_size: int = Form(...),
-    time_window_minutes: int = Form(30),
-    notes: str = Form(""),
-    restaurant_name: str = Form(""),
-    restaurant_phone: str = Form(""),
-    authorization: str = Header(None),
-):
-    user_id = get_current_user_id(authorization)
-
-    req = BookingRequest(
-        name=name,
-        city=city,
-        date=date,
-        time=time,
-        party_size=party_size,
-        time_window_minutes=time_window_minutes,
-        notes=notes,
-        restaurant_name=restaurant_name,
-        restaurant_phone=restaurant_phone,
-    )
-
-    result = book(req, user_id)
-    return RedirectResponse(
-        url=f"/ui/status/{result['booking_id']}",
-        status_code=303
-    )
-
-
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return "<h1>Tabel</h1><p>Use the app client to authenticate.</p>"
+    return f"""
+    <html>
+      <head><title>Tabel</title></head>
+      <body style="font-family: Arial; max-width: 700px; margin: 40px auto;">
+        <h1>Tabel</h1>
+        <p>Phase 3: Auth + protected endpoints.</p>
+        <ul>
+          <li><a href="/ui/login">Login</a> (Google)</li>
+          <li><a href="/ui/me">Who am I?</a> (requires login)</li>
+          <li><a href="/docs">Swagger</a></li>
+        </ul>
+      </body>
+    </html>
+    """
