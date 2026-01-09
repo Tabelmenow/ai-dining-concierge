@@ -6,6 +6,10 @@ from fastapi import (
     Header,
     Depends
 )
+import httpx
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 import uuid
@@ -28,6 +32,124 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     supabase = None
 else:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+
+@app.get("/ui/login", response_class=HTMLResponse)
+def ui_login_page():
+    # Simple page with a "Login with Google" button
+    return """
+    <html>
+      <head><title>Tabel Login</title></head>
+      <body style="font-family: Arial; max-width: 700px; margin: 40px auto;">
+        <h1>Login</h1>
+        <p>Click to sign in with Google.</p>
+        <p><a href="/auth/google/start">Sign in with Google</a></p>
+        <hr>
+        <p><small><a href="/">Home</a> | <a href="/docs">Swagger</a></small></p>
+      </body>
+    </html>
+    """
+
+
+@app.get("/auth/google/start")
+def auth_google_start():
+    """
+    Redirects the user to Supabase's Google OAuth flow.
+    Supabase will send them back to /auth/callback on this site.
+    """
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        raise HTTPException(status_code=500, detail="Missing SUPABASE_URL or SUPABASE_ANON_KEY")
+
+    redirect_to = "https://ai-dining-concierge.onrender.com/auth/callback"
+
+    # This is the Supabase Auth URL that starts OAuth with Google
+    # Note: provider=google and redirect_to is where Supabase sends the user after login
+    url = (
+        f"{SUPABASE_URL}/auth/v1/authorize"
+        f"?provider=google"
+        f"&redirect_to={redirect_to}"
+    )
+
+    # Supabase expects the API key header; easiest is to redirect user to url and include key later is not possible in a redirect
+    # So we do the recommended method: use the "auth/v1/authorize" endpoint which works with browser redirects.
+    return RedirectResponse(url=url, status_code=302)
+
+
+@app.get("/auth/callback", response_class=HTMLResponse)
+async def auth_callback(request: Request):
+    """
+    Supabase redirects back here with a 'code' parameter.
+    We exchange that 'code' for a session (access token + user info).
+    Then we display the user's email as proof it worked.
+    """
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        raise HTTPException(status_code=500, detail="Missing SUPABASE_URL or SUPABASE_ANON_KEY")
+
+    code = request.query_params.get("code")
+    error = request.query_params.get("error")
+    error_desc = request.query_params.get("error_description")
+
+    if error:
+        return f"""
+        <html><body style="font-family: Arial; max-width: 700px; margin: 40px auto;">
+          <h1>Login failed</h1>
+          <p><strong>Error:</strong> {error}</p>
+          <p><strong>Details:</strong> {error_desc}</p>
+          <p><a href="/ui/login">Try again</a></p>
+        </body></html>
+        """
+
+    if not code:
+        return """
+        <html><body style="font-family: Arial; max-width: 700px; margin: 40px auto;">
+          <h1>Missing code</h1>
+          <p>Supabase did not send a 'code'. This usually means redirect URLs are not configured correctly.</p>
+          <p><a href="/ui/login">Try again</a></p>
+        </body></html>
+        """
+
+    # Exchange the code for a session using Supabase token endpoint
+    token_url = f"{SUPABASE_URL}/auth/v1/token?grant_type=pkce"
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(
+            token_url,
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Content-Type": "application/json",
+            },
+            json={"auth_code": code},
+        )
+
+    if resp.status_code >= 400:
+        return f"""
+        <html><body style="font-family: Arial; max-width: 700px; margin: 40px auto;">
+          <h1>Token exchange failed</h1>
+          <p>Status: {resp.status_code}</p>
+          <pre>{resp.text}</pre>
+          <p><a href="/ui/login">Try again</a></p>
+        </body></html>
+        """
+
+    data = resp.json()
+    user = (data.get("user") or {})
+    email = user.get("email", "(no email returned)")
+    provider = user.get("app_metadata", {}).get("provider", "unknown")
+
+    return f"""
+    <html>
+      <head><title>Login success</title></head>
+      <body style="font-family: Arial; max-width: 700px; margin: 40px auto;">
+        <h1>Login success</h1>
+        <p><strong>Provider:</strong> {provider}</p>
+        <p><strong>Email:</strong> {email}</p>
+        <p>This proves Google sign-in worked.</p>
+        <hr>
+        <p><a href="/">Go home</a> | <a href="/ui/login">Login page</a></p>
+      </body>
+    </html>
+    """
 
 
 # =====================================================
