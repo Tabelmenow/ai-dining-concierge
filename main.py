@@ -12,6 +12,8 @@ from datetime import datetime, timezone, timedelta
 
 app = FastAPI()
 
+DRY_RUN_CALLS = os.environ.get("DRY_RUN_CALLS", "false").lower() == "true"
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
@@ -395,6 +397,10 @@ def call_test(booking_id: str):
     log_event(booking_data, "call_destination_resolved", {"mode": mode, "to": to_number})
 
     log_event(booking_data, "call_initiated", {"mode": "twilio"})
+    if DRY_RUN_CALLS:
+    log_event(booking_data, "dry_run_call_skipped", {"to": to_number, "to_mode": mode})
+    supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
+    return {"message": "Dry run: call skipped (no Twilio call placed)", "to_mode": mode}
     sid = make_call(to_number)
 
     booking_data["call"] = {
@@ -522,6 +528,7 @@ def debug_env():
         "TWILIO_NUMBER_set": bool(os.environ.get("TWILIO_NUMBER")),
         "FOUNDER_PHONE_set": bool(os.environ.get("FOUNDER_PHONE")),
         "ALLOW_REAL_RESTAURANT_CALLS": ALLOW_REAL_RESTAURANT_CALLS,
+        "DRY_RUN_CALLS": DRY_RUN_CALLS,
     }
 
 
