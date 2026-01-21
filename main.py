@@ -644,7 +644,7 @@ def ui_status(booking_id: str):
         <p>
           <a href="/call-script/{booking_id}" style="margin-right: 12px;">View call script</a>
           <a href="/ui/call-outcome/{booking_id}" style="margin-right: 12px;">Record call outcome</a>
-          <a href="/docs" style="margin-right: 12px;">Confirm (via Swagger)</a>
+          <a href="/ui/confirm/{booking_id}" style="margin-right: 12px;">Confirm booking</a>
         </p>
 
         <h2>Progress</h2>
@@ -729,3 +729,61 @@ def ui_call_outcome_submit(
         reference=reference,
     )
     return RedirectResponse(url=f"/ui/status/{booking_id}", status_code=303)
+
+@app.get("/ui/confirm/{booking_id}", response_class=HTMLResponse)
+def ui_confirm_form(booking_id: str):
+    booking_data = status(booking_id)  # will raise 404 if missing
+    req = booking_data.get("request") or {}
+    rname = (req.get("restaurant_name") or "").strip() or "the restaurant"
+
+    return f"""
+    <html>
+      <head><title>Confirm Booking</title></head>
+      <body style="font-family: Arial, sans-serif; max-width: 700px; margin: 40px auto;">
+        <h1>Confirm booking</h1>
+        <p><strong>Booking:</strong> {booking_id}</p>
+        <p><strong>Restaurant:</strong> {rname}</p>
+
+        <p style="background:#f4f4f4;padding:12px;border-radius:8px;">
+          Only confirm if you have real proof (example: “Spoke to manager Sarah, confirmed 7pm under John, ref 123”).
+        </p>
+
+        <form action="/ui/confirm/{booking_id}" method="post">
+          <label>Method</label><br>
+          <select name="method" required style="width: 100%; padding: 8px;">
+            <option value="phone">phone</option>
+            <option value="digital">digital</option>
+            <option value="in_person">in_person</option>
+          </select><br><br>
+
+          <label>Confirmed by (who did you speak to / who confirmed?)</label><br>
+          <input name="confirmed_by" required style="width: 100%; padding: 8px;" placeholder="e.g. Manager Sarah"><br><br>
+
+          <label>Proof (what happened — must be at least 10 characters)</label><br>
+          <input name="proof" required style="width: 100%; padding: 8px;"
+                 placeholder="e.g. Spoke to Sarah. Confirmed table for 4 at 19:00 under Test User. Ref ABC123"><br><br>
+
+          <button type="submit" style="padding: 10px 16px;">Confirm now</button>
+          <a href="/ui/status/{booking_id}" style="margin-left: 12px;">Cancel</a>
+        </form>
+
+        <hr style="margin: 20px 0;">
+        <p><small><a href="/ui/status/{booking_id}">Back to status</a></small></p>
+      </body>
+    </html>
+    """
+@app.post("/ui/confirm/{booking_id}")
+def ui_confirm_submit(
+    booking_id: str,
+    method: str = Form(...),
+    confirmed_by: str = Form(...),
+    proof: str = Form(...),
+):
+    confirm_booking(
+        booking_id=booking_id,
+        proof=proof,
+        confirmed_by=confirmed_by,
+        method=method,
+    )
+    return RedirectResponse(url=f"/ui/status/{booking_id}", status_code=303)
+
