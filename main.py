@@ -398,10 +398,10 @@ def call_test(booking_id: str):
 
     log_event(booking_data, "call_initiated", {"mode": "twilio"})
     if DRY_RUN_CALLS:
-    log_event(booking_data, "dry_run_call_skipped", {"to": to_number, "to_mode": mode})
-    supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
-    return {"message": "Dry run: call skipped (no Twilio call placed)", "to_mode": mode}
-    sid = make_call(to_number)
+        log_event(booking_data, "dry_run_call_skipped", {"to": to_number, "to_mode": mode})
+        supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
+        return {"message": "Dry run: call skipped (no Twilio call placed)", "to_mode": mode}
+        sid = make_call(to_number)
 
     booking_data["call"] = {
         "call_sid": sid,
