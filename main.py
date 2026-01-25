@@ -763,7 +763,7 @@ def ui_book_form(msg: str = ""):
           <input type="date" name="date" required style="width: 100%; padding: 8px;"><br><br>
 
           <label>Time</label><br>
-          <input type="time" name="time" required style="width: 100%; padding: 8px;"><br><br>
+          <input type="time" name="time_str" required style="width: 100%; padding: 8px;"><br><br>
 
           <label>Party size</label><br>
           <input type="number" name="party_size" min="1" required style="width: 100%; padding: 8px;"><br><br>
