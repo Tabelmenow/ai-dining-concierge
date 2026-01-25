@@ -1,8 +1,7 @@
-fastapi
-uvicorn[standard]
-twilio
-supabase
-python-multipart
-stripe
-httpx
-pyjwt
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+pydantic==2.5.3
+python-multipart==0.0.6
+twilio==8.11.0
+supabase==2.3.0
+python-dotenv==1.0.0
