@@ -1,17 +1,22 @@
-from fastapi import FastAPI, HTTPException, Query, Form
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, HTTPException, Query, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from pydantic import BaseModel
 import uuid
 import os
 import re
+import time
+import json
 from twilio.rest import Client
 from supabase import create_client
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from datetime import datetime, timezone, timedelta
 
 
 app = FastAPI()
 
+# =====================================================
+# Runtime toggles
+# =====================================================
 DRY_RUN_CALLS = os.environ.get("DRY_RUN_CALLS", "false").lower() == "true"
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -22,7 +27,6 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 else:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-
 # =====================================================
 # Phase 2 Step 4: Retry + timeout config
 # =====================================================
@@ -30,12 +34,27 @@ MAX_CALL_ATTEMPTS = 2
 CALL_COOLDOWN_MINUTES = 10
 BOOKING_TIMEOUT_MINUTES = 60
 
-
 # =====================================================
 # Phase 2 Step 5: Safe switch for real restaurant calling
-# Default: False (still calls founder)
 # =====================================================
 ALLOW_REAL_RESTAURANT_CALLS = os.environ.get("ALLOW_REAL_RESTAURANT_CALLS", "false").lower() == "true"
+
+# =====================================================
+# Phase 2 Step 7: Production safety + operator controls
+# =====================================================
+# Require explicit operator "arm" before any call can be placed
+REQUIRE_OPERATOR_ARM_FOR_CALL = True
+
+# Basic rate limiting (in-memory; good enough for MVP; not multi-instance safe)
+# You can tune these without breaking UX.
+BOOK_RATE_LIMIT_MAX = int(os.environ.get("BOOK_RATE_LIMIT_MAX", "10"))  # max bookings
+BOOK_RATE_LIMIT_WINDOW_SEC = int(os.environ.get("BOOK_RATE_LIMIT_WINDOW_SEC", "300"))  # per 5 min by IP
+
+CALL_RATE_LIMIT_MAX = int(os.environ.get("CALL_RATE_LIMIT_MAX", "6"))  # max call attempts (endpoint hits)
+CALL_RATE_LIMIT_WINDOW_SEC = int(os.environ.get("CALL_RATE_LIMIT_WINDOW_SEC", "300"))  # per 5 min by IP
+
+# Simple in-memory buckets
+_rate_buckets: dict[str, list[float]] = {}
 
 
 # =====================================================
@@ -82,6 +101,14 @@ def can_call_again(booking_data: dict) -> tuple[bool, str]:
     return True, "OK"
 
 
+def log_json(event: str, payload: dict) -> None:
+    # Render logs: keep it grep-able and structured enough
+    try:
+        print(json.dumps({"event": event, "time": now_iso(), **payload}, ensure_ascii=False))
+    except Exception:
+        print(f"[{now_iso()}] {event} {payload}")
+
+
 def log_event(booking_data: dict, event_type: str, details: dict | None = None) -> None:
     booking_data.setdefault("events", [])
     booking_data["events"].append({
@@ -123,6 +150,45 @@ def is_valid_phone_e164(phone: str) -> bool:
     if not phone:
         return False
     return bool(re.fullmatch(r"\+[1-9]\d{7,14}", phone.strip()))
+
+
+def get_client_ip(request: Request) -> str:
+    # Trust X-Forwarded-For if present (Render/proxy)
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_key(scope: str, ip: str) -> str:
+    return f"{scope}:{ip}"
+
+
+def rate_limit_or_429(scope: str, ip: str, max_events: int, window_sec: int) -> None:
+    now = time.time()
+    key = _rate_key(scope, ip)
+    bucket = _rate_buckets.setdefault(key, [])
+    # drop old
+    bucket[:] = [t for t in bucket if (now - t) <= window_sec]
+    if len(bucket) >= max_events:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many requests. Please wait and try again. (limit={max_events} per {window_sec}s)"
+        )
+    bucket.append(now)
+
+
+def terminal_status(status: str) -> bool:
+    return status in ("confirmed", "failed", "expired", "cancelled")
+
+
+def ensure_not_terminal(booking_data: dict) -> None:
+    if terminal_status(booking_data.get("status", "")):
+        raise HTTPException(status_code=400, detail=f"Booking is already {booking_data.get('status')}.")
+
+
+def ui_redirect_with_msg(url: str, msg: str) -> RedirectResponse:
+    return RedirectResponse(url=f"{url}?msg={quote(msg)}", status_code=303)
 
 
 # =====================================================
@@ -175,15 +241,15 @@ def build_call_script(booking_data: dict, restaurant_name: str = "the restaurant
     name = req["name"]
     party = req["party_size"]
     date = req["date"]
-    time = req["time"]
+    time_str = req["time"]
     window = req.get("time_window_minutes", 30)
     notes = req.get("notes", "")
 
-    earliest, latest = compute_time_window(time, window)
+    earliest, latest = compute_time_window(time_str, window)
 
     opening = "Hi there. Quick booking request, please."
-    request_line = f"Could I please book a table for {party} on {date} around {time}, under the name {name}?"
-    fallback_line = f"If {time} isn’t available, anything between {earliest} and {latest} would work."
+    request_line = f"Could I please book a table for {party} on {date} around {time_str}, under the name {name}?"
+    fallback_line = f"If {time_str} isn’t available, anything between {earliest} and {latest} would work."
     notes_line = f"One note: {notes}" if notes.strip() else ""
     proof_line = "If you can confirm it, what time is it booked for and what name should I put it under? Any reference number?"
     close = "Thanks very much. Appreciate it."
@@ -207,7 +273,7 @@ def compute_next_action(booking_data: dict) -> str:
     outcome_obj = booking_data.get("call_outcome") or {}
     outcome = outcome_obj.get("outcome")
 
-    if status in ("confirmed", "failed", "expired"):
+    if status in ("confirmed", "failed", "expired", "cancelled"):
         return "No further action needed."
 
     if is_expired(booking_data):
@@ -218,6 +284,12 @@ def compute_next_action(booking_data: dict) -> str:
 
     if status == "awaiting_confirmation":
         return "Call outcome is CONFIRMED. Next: confirm the booking (with proof)."
+
+    # Step 7: operator must arm before calling
+    if REQUIRE_OPERATOR_ARM_FOR_CALL and not booking_data.get("operator_call_armed"):
+        if call_allowed:
+            return "Next: operator must ARM the call (then you can place the call)."
+        return "Call not allowed for this booking."
 
     if call_allowed and not call_sid:
         return "Next: place a call (and read the call script)."
@@ -249,10 +321,24 @@ class BookingRequest(BaseModel):
 # =====================================================
 # Core API
 # =====================================================
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "time": now_iso(),
+        "supabase_configured": bool(supabase),
+        "dry_run_calls": DRY_RUN_CALLS,
+        "allow_real_restaurant_calls": ALLOW_REAL_RESTAURANT_CALLS,
+    }
+
+
 @app.post("/book")
-def book(req: BookingRequest):
+def book(req: BookingRequest, request: Request):
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not configured")
+
+    ip = get_client_ip(request)
+    rate_limit_or_429("book", ip, BOOK_RATE_LIMIT_MAX, BOOK_RATE_LIMIT_WINDOW_SEC)
 
     booking_id = str(uuid.uuid4())
     req_data = req.model_dump()
@@ -283,7 +369,11 @@ def book(req: BookingRequest):
         "call_attempts": 0,
         "last_call_at": None,
         "expires_at": None,
-        "final_reason": None
+        "final_reason": None,
+
+        # Step 7: operator controls
+        "operator_call_armed": False,
+        "operator_armed_at": None,
     }
 
     booking_data["expires_at"] = compute_expires_at(booking_data["created_at"])
@@ -293,8 +383,11 @@ def book(req: BookingRequest):
     log_event(booking_data, "strategy_suggested", strategy)
     log_event(booking_data, "digital_attempted", digital_result)
     log_event(booking_data, "call_decision_made", {"call_allowed": call_allowed})
+    log_event(booking_data, "operator_arm_required", {"required": REQUIRE_OPERATOR_ARM_FOR_CALL})
 
     supabase.table("bookings").insert({"id": booking_id, "data": booking_data}).execute()
+
+    log_json("booking_created", {"booking_id": booking_id, "ip": ip, "call_allowed": call_allowed})
 
     return {
         "booking_id": booking_id,
@@ -333,6 +426,8 @@ def timeline(booking_id: str):
             timeline_steps.append({"step": "Request received", "time": t})
         elif et == "digital_attempted":
             timeline_steps.append({"step": "Searching digitally", "time": t})
+        elif et == "operator_call_armed":
+            timeline_steps.append({"step": "Operator armed calling", "time": t})
         elif et == "call_script_generated":
             timeline_steps.append({"step": "Preparing call script", "time": t})
         elif et == "call_initiated":
@@ -346,6 +441,8 @@ def timeline(booking_id: str):
             timeline_steps.append({"step": "Booking confirmed", "time": t})
         elif et == "booking_failed":
             timeline_steps.append({"step": "Booking failed", "time": t})
+        elif et == "booking_cancelled":
+            timeline_steps.append({"step": "Booking cancelled", "time": t})
         elif et == "booking_expired":
             timeline_steps.append({"step": "Booking expired (timeout)", "time": t})
 
@@ -353,16 +450,68 @@ def timeline(booking_id: str):
         "booking_id": booking_id,
         "status": booking_data.get("status"),
         "expires_at": booking_data.get("expires_at"),
+        "final_reason": booking_data.get("final_reason"),
         "timeline": timeline_steps
     }
 
 
-@app.post("/call-test/{booking_id}")
-def call_test(booking_id: str):
+@app.post("/arm-call/{booking_id}")
+def arm_call(booking_id: str):
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not configured")
 
     booking_data = status(booking_id)
+    ensure_not_terminal(booking_data)
+
+    if is_expired(booking_data):
+        booking_data["status"] = "expired"
+        booking_data["final_reason"] = "timeout"
+        log_event(booking_data, "booking_expired", {"reason": booking_data["final_reason"]})
+        supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
+        raise HTTPException(status_code=400, detail="Booking has expired (timeout)")
+
+    if booking_data.get("call_allowed") is not True:
+        raise HTTPException(status_code=400, detail="Call not allowed for this booking (call_allowed is false)")
+
+    booking_data["operator_call_armed"] = True
+    booking_data["operator_armed_at"] = now_iso()
+    log_event(booking_data, "operator_call_armed", {"armed_at": booking_data["operator_armed_at"]})
+
+    supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
+    return {"message": "Call armed", "booking_id": booking_id}
+
+
+@app.post("/cancel/{booking_id}")
+def cancel_booking(
+    booking_id: str,
+    reason: str = Query("user_cancelled", max_length=80)
+):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+
+    booking_data = status(booking_id)
+
+    if terminal_status(booking_data.get("status", "")):
+        return {"message": f"Already {booking_data.get('status')}", "status": booking_data.get("status")}
+
+    booking_data["status"] = "cancelled"
+    booking_data["final_reason"] = reason
+    log_event(booking_data, "booking_cancelled", {"reason": reason})
+
+    supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
+    return {"message": "Cancelled", "booking_id": booking_id, "status": booking_data["status"], "final_reason": reason}
+
+
+@app.post("/call-test/{booking_id}")
+def call_test(booking_id: str, request: Request):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+
+    ip = get_client_ip(request)
+    rate_limit_or_429("call", ip, CALL_RATE_LIMIT_MAX, CALL_RATE_LIMIT_WINDOW_SEC)
+
+    booking_data = status(booking_id)
+    ensure_not_terminal(booking_data)
 
     if booking_data.get("status") != "pending":
         raise HTTPException(status_code=400, detail=f"Cannot call because status is '{booking_data.get('status')}'")
@@ -370,9 +519,13 @@ def call_test(booking_id: str):
     if booking_data.get("call_allowed") is not True:
         raise HTTPException(status_code=400, detail="Call not allowed for this booking (call_allowed is false)")
 
+    # Step 7: explicit operator arming
+    if REQUIRE_OPERATOR_ARM_FOR_CALL and not booking_data.get("operator_call_armed"):
+        raise HTTPException(status_code=400, detail="Operator must ARM the call before calling.")
+
     if is_expired(booking_data):
         booking_data["status"] = "expired"
-        booking_data["final_reason"] = "Timed out before confirmation"
+        booking_data["final_reason"] = "timeout"
         log_event(booking_data, "booking_expired", {"reason": booking_data["final_reason"]})
         supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
         raise HTTPException(status_code=400, detail="Booking has expired (timeout)")
@@ -397,11 +550,14 @@ def call_test(booking_id: str):
     log_event(booking_data, "call_destination_resolved", {"mode": mode, "to": to_number})
 
     log_event(booking_data, "call_initiated", {"mode": "twilio"})
+    log_json("call_initiated", {"booking_id": booking_id, "ip": ip, "to_mode": mode, "dry_run": DRY_RUN_CALLS})
+
     if DRY_RUN_CALLS:
         log_event(booking_data, "dry_run_call_skipped", {"to": to_number, "to_mode": mode})
         supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
         return {"message": "Dry run: call skipped (no Twilio call placed)", "to_mode": mode}
-        sid = make_call(to_number)
+
+    sid = make_call(to_number)
 
     booking_data["call"] = {
         "call_sid": sid,
@@ -434,9 +590,7 @@ def call_outcome(
         raise HTTPException(status_code=500, detail="Supabase not configured")
 
     booking_data = status(booking_id)
-
-    if booking_data.get("status") in ("confirmed", "failed", "expired"):
-        raise HTTPException(status_code=400, detail=f"Cannot record outcome because status is '{booking_data.get('status')}'")
+    ensure_not_terminal(booking_data)
 
     booking_data["call_outcome"] = {
         "outcome": outcome,
@@ -452,10 +606,10 @@ def call_outcome(
         log_event(booking_data, "status_changed", {"status": booking_data["status"]})
     elif outcome == "DECLINED":
         booking_data["status"] = "failed"
-        booking_data["final_reason"] = "Restaurant declined the booking request"
+        booking_data["final_reason"] = "declined"
         log_event(booking_data, "booking_failed", {"reason": booking_data["final_reason"]})
     elif outcome == "NO_ANSWER":
-        log_event(booking_data, "retry_possible", {"reason": "No answer"})
+        log_event(booking_data, "retry_possible", {"reason": "no_answer"})
     elif outcome == "OFFERED_ALTERNATIVE":
         booking_data["status"] = "needs_user_decision"
         log_event(booking_data, "status_changed", {"status": booking_data["status"]})
@@ -479,9 +633,12 @@ def confirm_booking(
     if booking_data.get("status") == "confirmed":
         return {"message": "Already confirmed", "confirmation": booking_data.get("confirmation")}
 
+    if terminal_status(booking_data.get("status", "")):
+        raise HTTPException(status_code=400, detail=f"Cannot confirm because status is '{booking_data.get('status')}'")
+
     if is_expired(booking_data):
         booking_data["status"] = "expired"
-        booking_data["final_reason"] = "Timed out before confirmation"
+        booking_data["final_reason"] = "timeout"
         log_event(booking_data, "booking_expired", {"reason": booking_data["final_reason"]})
         supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
         raise HTTPException(status_code=400, detail="Booking has expired (timeout)")
@@ -514,6 +671,27 @@ def confirm_booking(
 # =====================================================
 # Debug + UI
 # =====================================================
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    # For /ui/*, redirect back with a friendly message rather than a JSON error page.
+    if request.url.path.startswith("/ui/"):
+        # Try to send them back to a reasonable page
+        fallback = "/"
+        if "/ui/status/" in request.url.path:
+            fallback = request.url.path
+        elif "/ui/call-outcome/" in request.url.path or "/ui/confirm/" in request.url.path:
+            # go back to status view for that booking
+            parts = request.url.path.strip("/").split("/")
+            if len(parts) >= 3:
+                booking_id = parts[-1]
+                fallback = f"/ui/status/{booking_id}"
+
+        msg = exc.detail if isinstance(exc.detail, str) else "Something went wrong."
+        return ui_redirect_with_msg(fallback, msg)
+
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
 @app.get("/debug/env")
 def debug_env():
     supa_url = os.environ.get("SUPABASE_URL", "")
@@ -529,6 +707,11 @@ def debug_env():
         "FOUNDER_PHONE_set": bool(os.environ.get("FOUNDER_PHONE")),
         "ALLOW_REAL_RESTAURANT_CALLS": ALLOW_REAL_RESTAURANT_CALLS,
         "DRY_RUN_CALLS": DRY_RUN_CALLS,
+        "REQUIRE_OPERATOR_ARM_FOR_CALL": REQUIRE_OPERATOR_ARM_FOR_CALL,
+        "BOOK_RATE_LIMIT_MAX": BOOK_RATE_LIMIT_MAX,
+        "BOOK_RATE_LIMIT_WINDOW_SEC": BOOK_RATE_LIMIT_WINDOW_SEC,
+        "CALL_RATE_LIMIT_MAX": CALL_RATE_LIMIT_MAX,
+        "CALL_RATE_LIMIT_WINDOW_SEC": CALL_RATE_LIMIT_WINDOW_SEC,
     }
 
 
@@ -537,22 +720,28 @@ def home():
     return """
     <html>
       <head><title>Tabel</title></head>
-      <body style="font-family: Arial, sans-serif; max-width: 700px; margin: 40px auto;">
+      <body style="font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto;">
         <h1>Tabel</h1>
-        <p>Phase 2 baseline (no login).</p>
-        <p><a href="/ui/book">New booking</a> | <a href="/docs">Swagger</a></p>
+        <p>Phase 2 baseline + Step 7 safety controls (no login).</p>
+        <ul>
+          <li><a href="/ui/book">New booking</a></li>
+          <li><a href="/health">Health</a></li>
+          <li><a href="/docs">Swagger</a></li>
+        </ul>
       </body>
     </html>
     """
 
 
 @app.get("/ui/book", response_class=HTMLResponse)
-def ui_book_form():
-    return """
+def ui_book_form(msg: str = ""):
+    note = f"<p style='background:#fff3cd;padding:10px;border-radius:8px;border:1px solid #ffeeba;'><strong>Note:</strong> {msg}</p>" if msg else ""
+    return f"""
     <html>
       <head><title>New Booking</title></head>
-      <body style="font-family: Arial, sans-serif; max-width: 700px; margin: 40px auto;">
+      <body style="font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto;">
         <h1>New booking</h1>
+        {note}
 
         <form action="/ui/book" method="post">
           <h3>Restaurant (optional for now)</h3>
@@ -597,10 +786,11 @@ def ui_book_form():
 
 @app.post("/ui/book")
 def ui_book(
+    request: Request,
     name: str = Form(...),
     city: str = Form(...),
     date: str = Form(...),
-    time: str = Form(...),
+    time_str: str = Form(...),
     party_size: int = Form(...),
     time_window_minutes: int = Form(30),
     notes: str = Form(""),
@@ -611,41 +801,80 @@ def ui_book(
         name=name,
         city=city,
         date=date,
-        time=time,
+        time=time_str,
         party_size=party_size,
         time_window_minutes=time_window_minutes,
         notes=notes,
         restaurant_name=restaurant_name,
         restaurant_phone=restaurant_phone,
     )
-    result = book(req)
+    result = book(req, request)
     return RedirectResponse(url=f"/ui/status/{result['booking_id']}", status_code=303)
 
 
 @app.get("/ui/status/{booking_id}", response_class=HTMLResponse)
-def ui_status(booking_id: str):
+def ui_status(booking_id: str, msg: str = ""):
     booking_data = status(booking_id)
     data = timeline(booking_id)
 
     status_text = data.get("status", "unknown")
     steps = data.get("timeline", [])
     expires_at = data.get("expires_at", "")
+    final_reason = data.get("final_reason", "")
     next_action = compute_next_action(booking_data)
+
+    # operator arm/cancel controls
+    call_allowed = booking_data.get("call_allowed") is True
+    armed = booking_data.get("operator_call_armed") is True
+    terminal = terminal_status(status_text)
+
+    banner = ""
+    if msg:
+        banner = f"<p style='background:#e7f3ff;padding:10px;border-radius:8px;border:1px solid #b3d7ff;'><strong>Info:</strong> {msg}</p>"
+
+    reason_line = f"<p><strong>Final reason:</strong> {final_reason}</p>" if final_reason else ""
+
+    controls = ""
+    if not terminal:
+        controls += f"""
+        <form action="/ui/cancel/{booking_id}" method="post" style="display:inline;">
+          <button type="submit" style="padding: 8px 12px; margin-right: 10px;">Cancel booking</button>
+        </form>
+        """
+        if call_allowed and not armed and REQUIRE_OPERATOR_ARM_FOR_CALL:
+            controls += f"""
+            <form action="/ui/arm-call/{booking_id}" method="post" style="display:inline;">
+              <button type="submit" style="padding: 8px 12px; margin-right: 10px;">ARM call (operator)</button>
+            </form>
+            """
+
+        if call_allowed and (armed or not REQUIRE_OPERATOR_ARM_FOR_CALL):
+            controls += f"""
+            <form action="/ui/call/{booking_id}" method="post" style="display:inline;">
+              <button type="submit" style="padding: 8px 12px; margin-right: 10px;">Place call</button>
+            </form>
+            """
 
     html = f"""
     <html>
       <head><title>Booking Status</title></head>
-      <body style="font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto;">
+      <body style="font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto;">
         <h1>Booking Status</h1>
+        {banner}
         <p><strong>Status:</strong> {status_text}</p>
         <p><strong>Next action:</strong> {next_action}</p>
         <p><strong>Expires at (UTC):</strong> {expires_at}</p>
+        {reason_line}
 
-        <p>
-          <a href="/call-script/{booking_id}" style="margin-right: 12px;">View call script</a>
-          <a href="/ui/call-outcome/{booking_id}" style="margin-right: 12px;">Record call outcome</a>
-          <a href="/ui/confirm/{booking_id}" style="margin-right: 12px;">Confirm booking</a>
-        </p>
+        <div style="padding:12px;background:#f6f6f6;border-radius:10px;">
+          <p style="margin-top:0;"><strong>Controls</strong></p>
+          {controls if controls else "<p>No actions available.</p>"}
+          <p style="margin-bottom:0;">
+            <a href="/call-script/{booking_id}" style="margin-right: 12px;">View call script</a>
+            <a href="/ui/call-outcome/{booking_id}" style="margin-right: 12px;">Record call outcome</a>
+            <a href="/ui/confirm/{booking_id}" style="margin-right: 12px;">Confirm booking</a>
+          </p>
+        </div>
 
         <h2>Progress</h2>
         <ul>
@@ -670,17 +899,38 @@ def ui_status(booking_id: str):
     return html
 
 
+@app.post("/ui/arm-call/{booking_id}")
+def ui_arm_call(booking_id: str):
+    arm_call(booking_id)
+    return ui_redirect_with_msg(f"/ui/status/{booking_id}", "Call armed. You can now place the call.")
+
+
+@app.post("/ui/call/{booking_id}")
+def ui_call(booking_id: str, request: Request):
+    result = call_test(booking_id, request)
+    msg = result.get("message", "Call action complete.")
+    return ui_redirect_with_msg(f"/ui/status/{booking_id}", msg)
+
+
+@app.post("/ui/cancel/{booking_id}")
+def ui_cancel(booking_id: str):
+    cancel_booking(booking_id, reason="user_cancelled")
+    return ui_redirect_with_msg(f"/ui/status/{booking_id}", "Booking cancelled.")
+
+
 @app.get("/ui/call-outcome/{booking_id}", response_class=HTMLResponse)
-def ui_call_outcome_form(booking_id: str):
+def ui_call_outcome_form(booking_id: str, msg: str = ""):
     booking_data = status(booking_id)
     req = booking_data.get("request") or {}
     rname = (req.get("restaurant_name") or "").strip() or "the restaurant"
+    banner = f"<p style='background:#e7f3ff;padding:10px;border-radius:8px;border:1px solid #b3d7ff;'><strong>Info:</strong> {msg}</p>" if msg else ""
 
     return f"""
     <html>
       <head><title>Call Outcome</title></head>
-      <body style="font-family: Arial, sans-serif; max-width: 700px; margin: 40px auto;">
+      <body style="font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto;">
         <h1>Record Call Outcome</h1>
+        {banner}
         <p><strong>Booking:</strong> {booking_id}</p>
         <p><strong>Restaurant:</strong> {rname}</p>
 
@@ -728,19 +978,22 @@ def ui_call_outcome_submit(
         confirmed_time=confirmed_time,
         reference=reference,
     )
-    return RedirectResponse(url=f"/ui/status/{booking_id}", status_code=303)
+    return ui_redirect_with_msg(f"/ui/status/{booking_id}", "Call outcome saved.")
+
 
 @app.get("/ui/confirm/{booking_id}", response_class=HTMLResponse)
-def ui_confirm_form(booking_id: str):
+def ui_confirm_form(booking_id: str, msg: str = ""):
     booking_data = status(booking_id)  # will raise 404 if missing
     req = booking_data.get("request") or {}
     rname = (req.get("restaurant_name") or "").strip() or "the restaurant"
+    banner = f"<p style='background:#e7f3ff;padding:10px;border-radius:8px;border:1px solid #b3d7ff;'><strong>Info:</strong> {msg}</p>" if msg else ""
 
     return f"""
     <html>
       <head><title>Confirm Booking</title></head>
-      <body style="font-family: Arial, sans-serif; max-width: 700px; margin: 40px auto;">
+      <body style="font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto;">
         <h1>Confirm booking</h1>
+        {banner}
         <p><strong>Booking:</strong> {booking_id}</p>
         <p><strong>Restaurant:</strong> {rname}</p>
 
@@ -772,6 +1025,8 @@ def ui_confirm_form(booking_id: str):
       </body>
     </html>
     """
+
+
 @app.post("/ui/confirm/{booking_id}")
 def ui_confirm_submit(
     booking_id: str,
@@ -785,5 +1040,4 @@ def ui_confirm_submit(
         confirmed_by=confirmed_by,
         method=method,
     )
-    return RedirectResponse(url=f"/ui/status/{booking_id}", status_code=303)
-
+    return ui_redirect_with_msg(f"/ui/status/{booking_id}", "Booking confirmed.")
