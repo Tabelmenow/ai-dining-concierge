@@ -6,6 +6,10 @@ import os
 import re
 import time
 import json
+import hmac
+import hashlib
+import base64
+import urllib.parse
 from twilio.rest import Client
 from supabase import create_client
 from urllib.parse import urlparse, quote
@@ -21,11 +25,18 @@ DRY_RUN_CALLS = os.environ.get("DRY_RUN_CALLS", "false").lower() == "true"
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY")
+
+SESSION_SECRET = (os.environ.get("SESSION_SECRET") or "").encode("utf-8")
+SESSION_COOKIE_NAME = "tabel_session"
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     supabase = None
 else:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Separate client for auth flows (anon key). If missing, login will fail clearly.
+supabase_auth = create_client(SUPABASE_URL, SUPABASE_ANON_KEY) if (SUPABASE_URL and SUPABASE_ANON_KEY) else None
 
 # =====================================================
 # Phase 2 Step 4: Retry + timeout config
@@ -44,7 +55,6 @@ ALLOW_REAL_RESTAURANT_CALLS = os.environ.get("ALLOW_REAL_RESTAURANT_CALLS", "fal
 # =====================================================
 REQUIRE_OPERATOR_ARM_FOR_CALL = True
 
-# Basic rate limiting (in-memory)
 BOOK_RATE_LIMIT_MAX = int(os.environ.get("BOOK_RATE_LIMIT_MAX", "10"))
 BOOK_RATE_LIMIT_WINDOW_SEC = int(os.environ.get("BOOK_RATE_LIMIT_WINDOW_SEC", "300"))
 
@@ -57,8 +67,7 @@ _rate_buckets: dict[str, list[float]] = {}
 # Phase 2 Step 8: Admin lookup + observability
 # =====================================================
 ADMIN_TOKEN = (os.environ.get("ADMIN_TOKEN") or "").strip()
-ADMIN_TOKEN_HEADER = "X-Admin-Token"  # send in header OR query param token
-
+ADMIN_TOKEN_HEADER = "X-Admin-Token"
 
 # =====================================================
 # Helpers
@@ -66,15 +75,12 @@ ADMIN_TOKEN_HEADER = "X-Admin-Token"  # send in header OR query param token
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-
 def parse_iso(dt_str: str) -> datetime:
     return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
-
 
 def compute_expires_at(created_at_iso: str) -> str:
     created = parse_iso(created_at_iso)
     return (created + timedelta(minutes=BOOKING_TIMEOUT_MINUTES)).isoformat()
-
 
 def is_expired(booking_data: dict) -> bool:
     expires_at = booking_data.get("expires_at")
@@ -82,35 +88,28 @@ def is_expired(booking_data: dict) -> bool:
         return False
     return datetime.now(timezone.utc) >= parse_iso(expires_at)
 
-
 def minutes_since(iso_time: str) -> float:
     t = parse_iso(iso_time)
     diff = datetime.now(timezone.utc) - t
     return diff.total_seconds() / 60.0
 
-
 def can_call_again(booking_data: dict) -> tuple[bool, str]:
     attempts = booking_data.get("call_attempts", 0)
     if attempts >= MAX_CALL_ATTEMPTS:
         return False, f"Max call attempts reached ({MAX_CALL_ATTEMPTS})"
-
     last_call_at = booking_data.get("last_call_at")
     if last_call_at:
         mins = minutes_since(last_call_at)
         if mins < CALL_COOLDOWN_MINUTES:
             wait = int(CALL_COOLDOWN_MINUTES - mins)
             return False, f"Cooldown active. Try again in ~{wait} minutes."
-
     return True, "OK"
 
-
 def log_json(event: str, payload: dict) -> None:
-    # Keep Render logs grep-able
     try:
         print(json.dumps({"event": event, "time": now_iso(), **payload}, ensure_ascii=False))
     except Exception:
         print(f"[{now_iso()}] {event} {payload}")
-
 
 def log_event(booking_data: dict, event_type: str, details: dict | None = None) -> None:
     booking_data.setdefault("events", [])
@@ -121,23 +120,18 @@ def log_event(booking_data: dict, event_type: str, details: dict | None = None) 
     })
     booking_data["last_updated_at"] = now_iso()
 
-
 def ai_suggest_strategy(_booking: dict) -> dict:
-    # AI suggestion only. Not confirmation.
     return {
         "recommended_action": "try_digital_first",
         "reason": "Try digital first; call only if digital fails.",
         "confidence": "medium"
     }
 
-
 def try_digital_booking(req: dict) -> dict:
-    # Simulates digital attempt (for now).
     party_size = req["party_size"]
     if party_size <= 4:
         return {"success": False, "reason": "No digital availability found"}
     return {"success": False, "reason": "Party size too large for digital"}
-
 
 def should_call_restaurant(context: dict) -> bool:
     if context["digital_attempt"]["success"] is True:
@@ -148,12 +142,10 @@ def should_call_restaurant(context: dict) -> bool:
         return False
     return True
 
-
 def is_valid_phone_e164(phone: str) -> bool:
     if not phone:
         return False
     return bool(re.fullmatch(r"\+[1-9]\d{7,14}", phone.strip()))
-
 
 def get_client_ip(request: Request) -> str:
     xff = request.headers.get("x-forwarded-for")
@@ -161,10 +153,8 @@ def get_client_ip(request: Request) -> str:
         return xff.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
-
 def _rate_key(scope: str, ip: str) -> str:
     return f"{scope}:{ip}"
-
 
 def rate_limit_or_429(scope: str, ip: str, max_events: int, window_sec: int) -> None:
     now = time.time()
@@ -178,19 +168,15 @@ def rate_limit_or_429(scope: str, ip: str, max_events: int, window_sec: int) -> 
         )
     bucket.append(now)
 
-
 def terminal_status(status: str) -> bool:
     return status in ("confirmed", "failed", "expired", "cancelled")
-
 
 def ensure_not_terminal(booking_data: dict) -> None:
     if terminal_status(booking_data.get("status", "")):
         raise HTTPException(status_code=400, detail=f"Booking is already {booking_data.get('status')}.")
 
-
 def ui_redirect_with_msg(url: str, msg: str) -> RedirectResponse:
     return RedirectResponse(url=f"{url}?msg={quote(msg)}", status_code=303)
-
 
 def require_admin(token_q: str | None, x_admin_token: str | None) -> None:
     if not ADMIN_TOKEN:
@@ -199,6 +185,75 @@ def require_admin(token_q: str | None, x_admin_token: str | None) -> None:
     if not provided or provided != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Admin access denied (missing or invalid token).")
 
+# =====================================================
+# Session cookies (Option 1)
+# We store the Supabase access_token inside an HttpOnly cookie,
+# signed so it can’t be tampered with.
+# =====================================================
+def _b64url(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode("utf-8").rstrip("=")
+
+def _b64url_decode(s: str) -> bytes:
+    pad = "=" * ((4 - (len(s) % 4)) % 4)
+    return base64.urlsafe_b64decode((s + pad).encode("utf-8"))
+
+def sign_token(token: str) -> str:
+    if not SESSION_SECRET:
+        raise HTTPException(status_code=500, detail="SESSION_SECRET is not set.")
+    mac = hmac.new(SESSION_SECRET, token.encode("utf-8"), hashlib.sha256).digest()
+    return f"{_b64url(token.encode('utf-8'))}.{_b64url(mac)}"
+
+def verify_signed_token(signed: str) -> str | None:
+    try:
+        raw_b64, mac_b64 = signed.split(".", 1)
+        token = _b64url_decode(raw_b64).decode("utf-8")
+        mac = _b64url_decode(mac_b64)
+        expected = hmac.new(SESSION_SECRET, token.encode("utf-8"), hashlib.sha256).digest()
+        if hmac.compare_digest(mac, expected):
+            return token
+        return None
+    except Exception:
+        return None
+
+def get_access_token_from_cookie(request: Request) -> str | None:
+    signed = request.cookies.get(SESSION_COOKIE_NAME)
+    if not signed:
+        return None
+    return verify_signed_token(signed)
+
+def require_login(request: Request) -> dict:
+    """
+    Returns supabase user object dict: {id, email, ...}
+    """
+    if not supabase_auth:
+        raise HTTPException(status_code=500, detail="SUPABASE_ANON_KEY not configured (auth disabled).")
+
+    token = get_access_token_from_cookie(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Not logged in. Please log in first.")
+
+    # Validate token with Supabase
+    try:
+        res = supabase_auth.auth.get_user(token)
+        user = getattr(res, "user", None) or (res.get("user") if isinstance(res, dict) else None)
+        if not user:
+            raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+        # python client user may be an object; normalize
+        if hasattr(user, "id"):
+            return {"id": user.id, "email": getattr(user, "email", None)}
+        return {"id": user.get("id"), "email": user.get("email")}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="Session invalid. Please log in again.")
+
+def assert_booking_owner(booking_data: dict, user_id: str) -> None:
+    owner = booking_data.get("user_id")
+    if not owner:
+        # legacy bookings created pre-auth
+        raise HTTPException(status_code=403, detail="This booking is not linked to a user. Create a new booking.")
+    if owner != user_id:
+        raise HTTPException(status_code=403, detail="You do not have access to this booking.")
 
 # =====================================================
 # Twilio calling
@@ -213,14 +268,12 @@ def make_call(to_number: str) -> str:
         raise HTTPException(status_code=400, detail="Invalid phone number format. Use E.164 like +6421...")
 
     client = Client(os.environ["TWILIO_SID"], os.environ["TWILIO_AUTH"])
-
     call = client.calls.create(
         to=to_number,
         from_=os.environ["TWILIO_NUMBER"],
         url="http://demo.twilio.com/docs/voice.xml"
     )
     return call.sid
-
 
 def resolve_call_destination(booking_data: dict) -> tuple[str, str]:
     req = booking_data.get("request") or {}
@@ -234,16 +287,14 @@ def resolve_call_destination(booking_data: dict) -> tuple[str, str]:
         raise HTTPException(status_code=500, detail="Missing environment variable: FOUNDER_PHONE")
     return founder, "founder_safe_default"
 
-
 # =====================================================
-# Polite deterministic call script
+# Call script
 # =====================================================
 def compute_time_window(time_str: str, window_minutes: int):
     t = datetime.strptime(time_str, "%H:%M")
     earliest = (t - timedelta(minutes=window_minutes)).strftime("%H:%M")
     latest = (t + timedelta(minutes=window_minutes)).strftime("%H:%M")
     return earliest, latest
-
 
 def build_call_script(booking_data: dict, restaurant_name: str = "the restaurant") -> dict:
     req = booking_data["request"]
@@ -256,23 +307,15 @@ def build_call_script(booking_data: dict, restaurant_name: str = "the restaurant
 
     earliest, latest = compute_time_window(time_str, window)
 
-    opening = "Hi there. Quick booking request, please."
-    request_line = f"Could I please book a table for {party} on {date} around {time_str}, under the name {name}?"
-    fallback_line = f"If {time_str} isn’t available, anything between {earliest} and {latest} would work."
-    notes_line = f"One note: {notes}" if notes.strip() else ""
-    proof_line = "If you can confirm it, what time is it booked for and what name should I put it under? Any reference number?"
-    close = "Thanks very much. Appreciate it."
-
     return {
         "restaurant_name": restaurant_name,
-        "opening": opening,
-        "request": request_line,
-        "fallback": fallback_line,
-        "notes": notes_line,
-        "proof_request": proof_line,
-        "close": close,
+        "opening": "Hi there. Quick booking request, please.",
+        "request": f"Could I please book a table for {party} on {date} around {time_str}, under the name {name}?",
+        "fallback": f"If {time_str} isn’t available, anything between {earliest} and {latest} would work.",
+        "notes": f"One note: {notes}" if notes.strip() else "",
+        "proof_request": "If you can confirm it, what time is it booked for and what name should I put it under? Any reference number?",
+        "close": "Thanks very much. Appreciate it.",
     }
-
 
 def compute_next_action(booking_data: dict) -> str:
     status = booking_data.get("status", "unknown")
@@ -284,32 +327,23 @@ def compute_next_action(booking_data: dict) -> str:
 
     if status in ("confirmed", "failed", "expired", "cancelled"):
         return "No further action needed."
-
     if is_expired(booking_data):
         return "This booking is expired. (You can create a new one.)"
-
     if status == "needs_user_decision":
         return "Restaurant offered an alternative. Record details and decide what to do next."
-
     if status == "awaiting_confirmation":
         return "Call outcome is CONFIRMED. Next: confirm the booking (with proof)."
-
     if REQUIRE_OPERATOR_ARM_FOR_CALL and not booking_data.get("operator_call_armed"):
         if call_allowed:
             return "Next: operator must ARM the call (then you can place the call)."
         return "Call not allowed for this booking."
-
     if call_allowed and not call_sid:
         return "Next: place a call (and read the call script)."
-
     if call_sid and outcome != "CONFIRMED":
         return "Next: record call outcome (NO_ANSWER / DECLINED / OFFERED_ALTERNATIVE / CONFIRMED)."
-
     if call_sid and outcome == "CONFIRMED":
         return "Next: confirm the booking (with proof)."
-
     return "Next: review details and continue."
-
 
 # =====================================================
 # Models
@@ -323,8 +357,7 @@ class BookingRequest(BaseModel):
     time_window_minutes: int = 30
     notes: str = ""
     restaurant_name: str = ""
-    restaurant_phone: str = ""  # E.164 preferred
-
+    restaurant_phone: str = ""
 
 # =====================================================
 # Core API
@@ -335,15 +368,19 @@ def health():
         "ok": True,
         "time": now_iso(),
         "supabase_configured": bool(supabase),
+        "supabase_auth_configured": bool(supabase_auth),
         "dry_run_calls": DRY_RUN_CALLS,
         "allow_real_restaurant_calls": ALLOW_REAL_RESTAURANT_CALLS,
         "require_operator_arm_for_call": REQUIRE_OPERATOR_ARM_FOR_CALL,
         "admin_token_configured": bool(ADMIN_TOKEN),
+        "session_secret_configured": bool(SESSION_SECRET),
     }
-
 
 @app.post("/book")
 def book(req: BookingRequest, request: Request):
+    # API booking creation also requires login now
+    user = require_login(request)
+
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not configured")
 
@@ -355,14 +392,10 @@ def book(req: BookingRequest, request: Request):
 
     strategy = ai_suggest_strategy(req_data)
     digital_result = try_digital_booking(req_data)
-
-    call_allowed = should_call_restaurant({
-        "request": req_data,
-        "strategy": strategy,
-        "digital_attempt": digital_result
-    })
+    call_allowed = should_call_restaurant({"request": req_data, "strategy": strategy, "digital_attempt": digital_result})
 
     booking_data = {
+        "user_id": user["id"],  # ownership
         "request": req_data,
         "status": "pending",
         "strategy": strategy,
@@ -374,19 +407,16 @@ def book(req: BookingRequest, request: Request):
         "confirmation": None,
         "created_at": now_iso(),
         "last_updated_at": now_iso(),
-
         "call_attempts": 0,
         "last_call_at": None,
         "expires_at": None,
         "final_reason": None,
-
         "operator_call_armed": False,
         "operator_armed_at": None,
     }
 
     booking_data["expires_at"] = compute_expires_at(booking_data["created_at"])
     log_event(booking_data, "timeout_set", {"expires_at": booking_data["expires_at"]})
-
     log_event(booking_data, "booking_created", {"city": req_data["city"], "party_size": req_data["party_size"]})
     log_event(booking_data, "strategy_suggested", strategy)
     log_event(booking_data, "digital_attempted", digital_result)
@@ -394,35 +424,26 @@ def book(req: BookingRequest, request: Request):
     log_event(booking_data, "operator_arm_required", {"required": REQUIRE_OPERATOR_ARM_FOR_CALL})
 
     supabase.table("bookings").insert({"id": booking_id, "data": booking_data}).execute()
+    log_json("booking_created", {"booking_id": booking_id, "user_id": user["id"], "ip": ip, "call_allowed": call_allowed})
 
-    log_json("booking_created", {"booking_id": booking_id, "ip": ip, "call_allowed": call_allowed})
-    return {
-        "booking_id": booking_id,
-        "status": booking_data["status"],
-        "strategy": booking_data["strategy"],
-        "digital_attempt": booking_data["digital_attempt"],
-        "created_at": booking_data["created_at"],
-        "call_allowed": booking_data["call_allowed"],
-        "expires_at": booking_data["expires_at"]
-    }
-
+    return {"booking_id": booking_id, "status": booking_data["status"], "expires_at": booking_data["expires_at"]}
 
 @app.get("/status/{booking_id}")
-def status(booking_id: str):
+def status(booking_id: str, request: Request):
+    user = require_login(request)
     if not supabase:
         raise HTTPException(status_code=500, detail="Supabase not configured")
-
     result = supabase.table("bookings").select("data").eq("id", booking_id).execute()
     if not result.data:
         raise HTTPException(status_code=404, detail="Booking not found")
-    return result.data[0]["data"]
-
+    booking_data = result.data[0]["data"]
+    assert_booking_owner(booking_data, user["id"])
+    return booking_data
 
 @app.get("/timeline/{booking_id}")
-def timeline(booking_id: str):
-    booking_data = status(booking_id)
+def timeline(booking_id: str, request: Request):
+    booking_data = status(booking_id, request)
     events = booking_data.get("events", [])
-
     timeline_steps = []
     for event in events:
         t = event.get("time")
@@ -448,8 +469,7 @@ def timeline(booking_id: str):
         elif et == "call_recorded":
             timeline_steps.append({"step": "Call connected (SID recorded)", "time": t})
         elif et == "call_outcome_recorded":
-            outcome = d.get("outcome", "unknown")
-            timeline_steps.append({"step": f"Call outcome recorded: {outcome}", "time": t})
+            timeline_steps.append({"step": f"Call outcome recorded: {d.get('outcome', 'unknown')}", "time": t})
         elif et == "status_changed":
             timeline_steps.append({"step": f"Status changed: {d.get('status', 'unknown')}", "time": t})
         elif et == "confirmation_recorded":
@@ -469,13 +489,9 @@ def timeline(booking_id: str):
         "timeline": timeline_steps
     }
 
-
 @app.post("/arm-call/{booking_id}")
-def arm_call(booking_id: str):
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-
-    booking_data = status(booking_id)
+def arm_call(booking_id: str, request: Request):
+    booking_data = status(booking_id, request)  # includes ownership check
     ensure_not_terminal(booking_data)
 
     if is_expired(booking_data):
@@ -491,53 +507,34 @@ def arm_call(booking_id: str):
     booking_data["operator_call_armed"] = True
     booking_data["operator_armed_at"] = now_iso()
     log_event(booking_data, "operator_call_armed", {"armed_at": booking_data["operator_armed_at"]})
-
     supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
-    log_json("call_armed", {"booking_id": booking_id})
     return {"message": "Call armed", "booking_id": booking_id}
 
-
 @app.post("/cancel/{booking_id}")
-def cancel_booking(
-    booking_id: str,
-    reason: str = Query("user_cancelled", max_length=80)
-):
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-
-    booking_data = status(booking_id)
+def cancel_booking(booking_id: str, request: Request, reason: str = Query("user_cancelled", max_length=80)):
+    booking_data = status(booking_id, request)
     if terminal_status(booking_data.get("status", "")):
         return {"message": f"Already {booking_data.get('status')}", "status": booking_data.get("status")}
-
     booking_data["status"] = "cancelled"
     booking_data["final_reason"] = reason
     log_event(booking_data, "booking_cancelled", {"reason": reason})
-
     supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
-    log_json("booking_cancelled", {"booking_id": booking_id, "reason": reason})
-    return {"message": "Cancelled", "booking_id": booking_id, "status": booking_data["status"], "final_reason": reason}
-
+    return {"message": "Cancelled", "booking_id": booking_id, "status": booking_data["status"]}
 
 @app.post("/call-test/{booking_id}")
 def call_test(booking_id: str, request: Request):
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
+    booking_data = status(booking_id, request)
+    ensure_not_terminal(booking_data)
 
     ip = get_client_ip(request)
     rate_limit_or_429("call", ip, CALL_RATE_LIMIT_MAX, CALL_RATE_LIMIT_WINDOW_SEC)
 
-    booking_data = status(booking_id)
-    ensure_not_terminal(booking_data)
-
     if booking_data.get("status") != "pending":
         raise HTTPException(status_code=400, detail=f"Cannot call because status is '{booking_data.get('status')}'")
-
     if booking_data.get("call_allowed") is not True:
         raise HTTPException(status_code=400, detail="Call not allowed for this booking (call_allowed is false)")
-
     if REQUIRE_OPERATOR_ARM_FOR_CALL and not booking_data.get("operator_call_armed"):
         raise HTTPException(status_code=400, detail="Operator must ARM the call before calling.")
-
     if is_expired(booking_data):
         booking_data["status"] = "expired"
         booking_data["final_reason"] = "timeout"
@@ -556,16 +553,11 @@ def call_test(booking_id: str, request: Request):
 
     booking_data["call_attempts"] = booking_data.get("call_attempts", 0) + 1
     booking_data["last_call_at"] = now_iso()
-    log_event(booking_data, "call_attempt_incremented", {
-        "call_attempts": booking_data["call_attempts"],
-        "last_call_at": booking_data["last_call_at"]
-    })
+    log_event(booking_data, "call_attempt_incremented", {"call_attempts": booking_data["call_attempts"], "last_call_at": booking_data["last_call_at"]})
 
     to_number, mode = resolve_call_destination(booking_data)
     log_event(booking_data, "call_destination_resolved", {"mode": mode, "to": to_number})
     log_event(booking_data, "call_initiated", {"mode": "twilio"})
-
-    log_json("call_initiated", {"booking_id": booking_id, "ip": ip, "to_mode": mode, "dry_run": DRY_RUN_CALLS})
 
     if DRY_RUN_CALLS:
         log_event(booking_data, "dry_run_call_skipped", {"to": to_number, "to_mode": mode})
@@ -573,47 +565,24 @@ def call_test(booking_id: str, request: Request):
         return {"message": "Dry run: call skipped (no Twilio call placed)", "to_mode": mode}
 
     sid = make_call(to_number)
-
-    booking_data["call"] = {
-        "call_sid": sid,
-        "called_at": now_iso(),
-        "to": to_number,
-        "to_mode": mode
-    }
+    booking_data["call"] = {"call_sid": sid, "called_at": now_iso(), "to": to_number, "to_mode": mode}
     log_event(booking_data, "call_recorded", {"call_sid": sid})
-
     supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
     return {"message": "Call placed and recorded", "call_sid": sid, "to_mode": mode}
-
-
-@app.get("/call-script/{booking_id}")
-def call_script(booking_id: str, restaurant_name: str = "the restaurant"):
-    booking_data = status(booking_id)
-    script = build_call_script(booking_data, restaurant_name=restaurant_name)
-    return {"booking_id": booking_id, "script": script}
-
 
 @app.post("/call-outcome/{booking_id}")
 def call_outcome(
     booking_id: str,
+    request: Request,
     outcome: str = Query(..., pattern="^(NO_ANSWER|DECLINED|OFFERED_ALTERNATIVE|CONFIRMED)$"),
     notes: str = Query("", max_length=300),
-    confirmed_time: str = Query("", description="Only if outcome=CONFIRMED, e.g. 19:15"),
-    reference: str = Query("", max_length=100)
+    confirmed_time: str = Query(""),
+    reference: str = Query("", max_length=100),
 ):
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-
-    booking_data = status(booking_id)
+    booking_data = status(booking_id, request)
     ensure_not_terminal(booking_data)
 
-    booking_data["call_outcome"] = {
-        "outcome": outcome,
-        "notes": notes,
-        "confirmed_time": confirmed_time,
-        "reference": reference,
-        "recorded_at": now_iso()
-    }
+    booking_data["call_outcome"] = {"outcome": outcome, "notes": notes, "confirmed_time": confirmed_time, "reference": reference, "recorded_at": now_iso()}
     log_event(booking_data, "call_outcome_recorded", booking_data["call_outcome"])
 
     if outcome == "CONFIRMED":
@@ -630,21 +599,17 @@ def call_outcome(
         log_event(booking_data, "status_changed", {"status": booking_data["status"]})
 
     supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
-    log_json("call_outcome_saved", {"booking_id": booking_id, "outcome": outcome, "status": booking_data.get("status")})
     return {"message": "Call outcome saved", "booking_id": booking_id, "outcome": outcome, "status": booking_data.get("status")}
-
 
 @app.post("/confirm/{booking_id}")
 def confirm_booking(
     booking_id: str,
-    proof: str = Query(..., min_length=10, description="Human-verifiable proof text"),
-    confirmed_by: str = Query(..., min_length=2, description="Who confirmed it"),
-    method: str = Query(..., pattern="^(phone|digital|in_person)$", description="How it was verified")
+    request: Request,
+    proof: str = Query(..., min_length=10),
+    confirmed_by: str = Query(..., min_length=2),
+    method: str = Query(..., pattern="^(phone|digital|in_person)$"),
 ):
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
-
-    booking_data = status(booking_id)
+    booking_data = status(booking_id, request)
 
     if booking_data.get("status") == "confirmed":
         return {"message": "Already confirmed", "confirmation": booking_data.get("confirmation")}
@@ -666,27 +631,18 @@ def confirm_booking(
         call_obj = booking_data.get("call") or {}
         if not call_obj.get("call_sid"):
             raise HTTPException(status_code=400, detail="Cannot confirm by phone without a recorded call SID")
-
         outcome_obj = booking_data.get("call_outcome") or {}
         if outcome_obj.get("outcome") != "CONFIRMED":
             raise HTTPException(status_code=400, detail="Cannot confirm by phone unless call outcome is CONFIRMED")
 
     booking_data["status"] = "confirmed"
-    booking_data["confirmation"] = {
-        "proof": proof,
-        "confirmed_by": confirmed_by,
-        "method": method,
-        "confirmed_at": now_iso()
-    }
+    booking_data["confirmation"] = {"proof": proof, "confirmed_by": confirmed_by, "method": method, "confirmed_at": now_iso()}
     log_event(booking_data, "confirmation_recorded", {"method": method, "confirmed_by": confirmed_by})
-
     supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
-    log_json("booking_confirmed", {"booking_id": booking_id, "method": method, "confirmed_by": confirmed_by})
     return {"message": "Confirmed", "booking_id": booking_id, "status": booking_data["status"]}
 
-
 # =====================================================
-# Admin API (Step 8)
+# Admin API
 # =====================================================
 @app.get("/admin/booking/{booking_id}")
 def admin_get_booking(
@@ -695,53 +651,128 @@ def admin_get_booking(
     x_admin_token: str | None = Header(default=None, alias=ADMIN_TOKEN_HEADER),
 ):
     require_admin(token, x_admin_token)
-    booking_data = status(booking_id)
-    return {"booking_id": booking_id, "data": booking_data}
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase not configured")
+    result = supabase.table("bookings").select("data").eq("id", booking_id).execute()
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    return {"booking_id": booking_id, "data": result.data[0]["data"]}
 
+# =====================================================
+# Auth UI (Phase 3.1)
+# =====================================================
+@app.get("/ui/login", response_class=HTMLResponse)
+def ui_login(msg: str = ""):
+    banner = f"<p style='background:#e7f3ff;padding:10px;border-radius:8px;border:1px solid #b3d7ff;'><strong>Info:</strong> {msg}</p>" if msg else ""
+    return f"""
+    <html>
+      <head><title>Tabel Login</title></head>
+      <body style="font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto;">
+        <h1>Log in to Tabel</h1>
+        {banner}
+        <p>Enter your email. We will send you a magic link to log in.</p>
+        <form action="/ui/login" method="post">
+          <label>Email</label><br>
+          <input name="email" type="email" required style="width: 100%; padding: 8px;"><br><br>
+          <button type="submit" style="padding: 10px 16px;">Send magic link</button>
+          <a href="/" style="margin-left: 12px;">Home</a>
+        </form>
+      </body>
+    </html>
+    """
+
+@app.post("/ui/login")
+def ui_login_submit(email: str = Form(...)):
+    if not supabase_auth:
+        raise HTTPException(status_code=500, detail="SUPABASE_ANON_KEY not configured (auth disabled).")
+
+    # Send magic link that returns to /auth/callback
+    redirect_to = "https://ai-dining-concierge.onrender.com/auth/callback"
+    supabase_auth.auth.sign_in_with_otp({"email": email, "options": {"email_redirect_to": redirect_to}})
+
+    return ui_redirect_with_msg("/ui/login", "Magic link sent. Check your email and click the link to finish login.")
+
+@app.get("/auth/callback")
+def auth_callback(request: Request):
+    """
+    Supabase magic link lands here with tokens in the URL fragment in many setups.
+    Some clients send as query params. We'll support query params:
+      ?access_token=...&refresh_token=...&type=magiclink
+    If tokens are not present, we show instructions.
+    """
+    params = dict(request.query_params)
+    access_token = params.get("access_token")
+
+    if not access_token:
+        # Many Supabase flows return tokens in URL fragment (#...) which the server cannot see.
+        # So we provide a tiny page that converts fragment -> query params and reloads.
+        return HTMLResponse("""
+        <html>
+          <head><title>Completing login...</title></head>
+          <body style="font-family: Arial, sans-serif; max-width: 800px; margin: 40px auto;">
+            <h1>Completing login...</h1>
+            <p>If you see this for more than a second, click the button below.</p>
+            <button onclick="
+              const hash = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash;
+              const q = new URLSearchParams(hash);
+              if (q.get('access_token')) {
+                window.location.href = '/auth/callback?' + q.toString();
+              } else {
+                document.getElementById('msg').innerText = 'No token found in link. Please request a new magic link.';
+              }
+            ">Finish login</button>
+            <p id="msg" style="margin-top:12px;color:#555;"></p>
+          </body>
+        </html>
+        """)
+
+    signed = sign_token(access_token)
+
+    resp = RedirectResponse(url="/ui/book", status_code=303)
+    resp.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=signed,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 7,  # 7 days
+    )
+    return resp
+
+@app.post("/ui/logout")
+def ui_logout():
+    resp = RedirectResponse(url="/ui/login?msg=" + quote("Logged out."), status_code=303)
+    resp.delete_cookie(SESSION_COOKIE_NAME)
+    return resp
 
 # =====================================================
 # Debug + UI
 # =====================================================
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    if request.url.path.startswith("/ui/"):
-        fallback = "/"
-        if "/ui/status/" in request.url.path:
-            fallback = request.url.path
-        elif "/ui/call-outcome/" in request.url.path or "/ui/confirm/" in request.url.path or "/ui/admin" in request.url.path:
-            # best effort
-            pass
-
+    if request.url.path.startswith("/ui/") or request.url.path.startswith("/auth/"):
+        # Redirect UI flows to login when not authenticated
+        if exc.status_code == 401:
+            return ui_redirect_with_msg("/ui/login", "Please log in first.")
         msg = exc.detail if isinstance(exc.detail, str) else "Something went wrong."
-        return ui_redirect_with_msg(fallback, msg)
-
+        return ui_redirect_with_msg("/ui/login", msg)
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-
 
 @app.get("/debug/env")
 def debug_env():
     supa_url = os.environ.get("SUPABASE_URL", "")
     parsed = urlparse(supa_url) if supa_url else None
-
     return {
         "SUPABASE_URL_set": bool(supa_url),
         "SUPABASE_URL_scheme": parsed.scheme if parsed else None,
         "SUPABASE_URL_netloc": parsed.netloc if parsed else None,
         "SUPABASE_KEY_set": bool(os.environ.get("SUPABASE_KEY")),
-        "TWILIO_SID_set": bool(os.environ.get("TWILIO_SID")),
-        "TWILIO_NUMBER_set": bool(os.environ.get("TWILIO_NUMBER")),
-        "FOUNDER_PHONE_set": bool(os.environ.get("FOUNDER_PHONE")),
-        "ALLOW_REAL_RESTAURANT_CALLS": ALLOW_REAL_RESTAURANT_CALLS,
+        "SUPABASE_ANON_KEY_set": bool(os.environ.get("SUPABASE_ANON_KEY")),
+        "SESSION_SECRET_set": bool(os.environ.get("SESSION_SECRET")),
+        "ADMIN_TOKEN_set": bool(os.environ.get("ADMIN_TOKEN")),
         "DRY_RUN_CALLS": DRY_RUN_CALLS,
-        "REQUIRE_OPERATOR_ARM_FOR_CALL": REQUIRE_OPERATOR_ARM_FOR_CALL,
-        "BOOK_RATE_LIMIT_MAX": BOOK_RATE_LIMIT_MAX,
-        "BOOK_RATE_LIMIT_WINDOW_SEC": BOOK_RATE_LIMIT_WINDOW_SEC,
-        "CALL_RATE_LIMIT_MAX": CALL_RATE_LIMIT_MAX,
-        "CALL_RATE_LIMIT_WINDOW_SEC": CALL_RATE_LIMIT_WINDOW_SEC,
-        "ADMIN_TOKEN_configured": bool(ADMIN_TOKEN),
-        "ADMIN_TOKEN_header": ADMIN_TOKEN_HEADER,
+        "ALLOW_REAL_RESTAURANT_CALLS": ALLOW_REAL_RESTAURANT_CALLS,
     }
-
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -750,20 +781,23 @@ def home():
       <head><title>Tabel</title></head>
       <body style="font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto;">
         <h1>Tabel</h1>
-        <p>Phase 2 baseline + Step 7 safety + Step 8 admin lookup (no login).</p>
+        <p>Now includes login (magic link) + per-user booking access.</p>
         <ul>
-          <li><a href="/ui/book">New booking</a></li>
-          <li><a href="/ui/admin">Admin console</a> (requires ADMIN_TOKEN)</li>
+          <li><a href="/ui/login">Login</a></li>
+          <li><a href="/ui/book">New booking</a> (requires login)</li>
           <li><a href="/health">Health</a></li>
           <li><a href="/docs">Swagger</a></li>
         </ul>
+        <form action="/ui/logout" method="post">
+          <button type="submit" style="padding:8px 12px;">Logout</button>
+        </form>
       </body>
     </html>
     """
 
-
 @app.get("/ui/book", response_class=HTMLResponse)
-def ui_book_form(msg: str = ""):
+def ui_book_form(request: Request, msg: str = ""):
+    require_login(request)
     note = f"<p style='background:#fff3cd;padding:10px;border-radius:8px;border:1px solid #ffeeba;'><strong>Note:</strong> {msg}</p>" if msg else ""
     return f"""
     <html>
@@ -807,11 +841,13 @@ def ui_book_form(msg: str = ""):
         </form>
 
         <hr style="margin: 20px 0;">
-        <p><small><a href="/">Home</a> | <a href="/ui/admin">Admin</a> | <a href="/docs">Swagger</a></small></p>
+        <p><small><a href="/">Home</a></small></p>
+        <form action="/ui/logout" method="post">
+          <button type="submit" style="padding:8px 12px;">Logout</button>
+        </form>
       </body>
     </html>
     """
-
 
 @app.post("/ui/book")
 def ui_book(
@@ -826,6 +862,7 @@ def ui_book(
     restaurant_name: str = Form(""),
     restaurant_phone: str = Form(""),
 ):
+    # Create booking via core API logic
     req = BookingRequest(
         name=name,
         city=city,
@@ -840,11 +877,10 @@ def ui_book(
     result = book(req, request)
     return RedirectResponse(url=f"/ui/status/{result['booking_id']}", status_code=303)
 
-
 @app.get("/ui/status/{booking_id}", response_class=HTMLResponse)
-def ui_status(booking_id: str, msg: str = ""):
-    booking_data = status(booking_id)
-    data = timeline(booking_id)
+def ui_status(request: Request, booking_id: str, msg: str = ""):
+    booking_data = status(booking_id, request)
+    data = timeline(booking_id, request)
 
     status_text = data.get("status", "unknown")
     steps = data.get("timeline", [])
@@ -856,10 +892,7 @@ def ui_status(booking_id: str, msg: str = ""):
     armed = booking_data.get("operator_call_armed") is True
     terminal = terminal_status(status_text)
 
-    banner = ""
-    if msg:
-        banner = f"<p style='background:#e7f3ff;padding:10px;border-radius:8px;border:1px solid #b3d7ff;'><strong>Info:</strong> {msg}</p>"
-
+    banner = f"<p style='background:#e7f3ff;padding:10px;border-radius:8px;border:1px solid #b3d7ff;'><strong>Info:</strong> {msg}</p>" if msg else ""
     reason_line = f"<p><strong>Final reason:</strong> {final_reason}</p>" if final_reason else ""
 
     controls = ""
@@ -897,7 +930,6 @@ def ui_status(booking_id: str, msg: str = ""):
           <p style="margin-top:0;"><strong>Controls</strong></p>
           {controls if controls else "<p>No actions available.</p>"}
           <p style="margin-bottom:0;">
-            <a href="/call-script/{booking_id}" style="margin-right: 12px;">View call script</a>
             <a href="/ui/call-outcome/{booking_id}" style="margin-right: 12px;">Record call outcome</a>
             <a href="/ui/confirm/{booking_id}" style="margin-right: 12px;">Confirm booking</a>
           </p>
@@ -919,35 +951,34 @@ def ui_status(booking_id: str, msg: str = ""):
 
         <hr style="margin: 20px 0;">
         <p><small>Booking ID: {booking_id}</small></p>
-        <p><small><a href="/ui/book">New booking</a> | <a href="/ui/admin">Admin</a> | <a href="/docs">Swagger</a></small></p>
+        <p><small><a href="/ui/book">New booking</a> | <a href="/">Home</a></small></p>
+        <form action="/ui/logout" method="post">
+          <button type="submit" style="padding:8px 12px;">Logout</button>
+        </form>
       </body>
     </html>
     """
     return html
 
-
 @app.post("/ui/arm-call/{booking_id}")
-def ui_arm_call(booking_id: str):
-    arm_call(booking_id)
+def ui_arm_call(request: Request, booking_id: str):
+    arm_call(booking_id, request)
     return ui_redirect_with_msg(f"/ui/status/{booking_id}", "Call armed. You can now place the call.")
 
-
 @app.post("/ui/call/{booking_id}")
-def ui_call(booking_id: str, request: Request):
+def ui_call(request: Request, booking_id: str):
     result = call_test(booking_id, request)
     msg = result.get("message", "Call action complete.")
     return ui_redirect_with_msg(f"/ui/status/{booking_id}", msg)
 
-
 @app.post("/ui/cancel/{booking_id}")
-def ui_cancel(booking_id: str):
-    cancel_booking(booking_id, reason="user_cancelled")
+def ui_cancel(request: Request, booking_id: str):
+    cancel_booking(booking_id, request, reason="user_cancelled")
     return ui_redirect_with_msg(f"/ui/status/{booking_id}", "Booking cancelled.")
 
-
 @app.get("/ui/call-outcome/{booking_id}", response_class=HTMLResponse)
-def ui_call_outcome_form(booking_id: str, msg: str = ""):
-    booking_data = status(booking_id)
+def ui_call_outcome_form(request: Request, booking_id: str, msg: str = ""):
+    booking_data = status(booking_id, request)
     req = booking_data.get("request") or {}
     rname = (req.get("restaurant_name") or "").strip() or "the restaurant"
     banner = f"<p style='background:#e7f3ff;padding:10px;border-radius:8px;border:1px solid #b3d7ff;'><strong>Info:</strong> {msg}</p>" if msg else ""
@@ -982,16 +1013,13 @@ def ui_call_outcome_form(booking_id: str, msg: str = ""):
           <button type="submit" style="padding: 10px 16px;">Save outcome</button>
           <a href="/ui/status/{booking_id}" style="margin-left: 12px;">Cancel</a>
         </form>
-
-        <hr style="margin: 20px 0;">
-        <p><small><a href="/ui/status/{booking_id}">Back to status</a></small></p>
       </body>
     </html>
     """
 
-
 @app.post("/ui/call-outcome/{booking_id}")
 def ui_call_outcome_submit(
+    request: Request,
     booking_id: str,
     outcome: str = Form(...),
     notes: str = Form(""),
@@ -1000,6 +1028,7 @@ def ui_call_outcome_submit(
 ):
     call_outcome(
         booking_id=booking_id,
+        request=request,
         outcome=outcome,
         notes=notes,
         confirmed_time=confirmed_time,
@@ -1007,10 +1036,9 @@ def ui_call_outcome_submit(
     )
     return ui_redirect_with_msg(f"/ui/status/{booking_id}", "Call outcome saved.")
 
-
 @app.get("/ui/confirm/{booking_id}", response_class=HTMLResponse)
-def ui_confirm_form(booking_id: str, msg: str = ""):
-    booking_data = status(booking_id)
+def ui_confirm_form(request: Request, booking_id: str, msg: str = ""):
+    booking_data = status(booking_id, request)
     req = booking_data.get("request") or {}
     rname = (req.get("restaurant_name") or "").strip() or "the restaurant"
     banner = f"<p style='background:#e7f3ff;padding:10px;border-radius:8px;border:1px solid #b3d7ff;'><strong>Info:</strong> {msg}</p>" if msg else ""
@@ -1025,7 +1053,7 @@ def ui_confirm_form(booking_id: str, msg: str = ""):
         <p><strong>Restaurant:</strong> {rname}</p>
 
         <p style="background:#f4f4f4;padding:12px;border-radius:8px;">
-          Only confirm if you have real proof (example: “Spoke to manager Sarah, confirmed 7pm under John, ref 123”).
+          Only confirm if you have real proof.
         </p>
 
         <form action="/ui/confirm/{booking_id}" method="post">
@@ -1036,26 +1064,22 @@ def ui_confirm_form(booking_id: str, msg: str = ""):
             <option value="in_person">in_person</option>
           </select><br><br>
 
-          <label>Confirmed by (who did you speak to / who confirmed?)</label><br>
-          <input name="confirmed_by" required style="width: 100%; padding: 8px;" placeholder="e.g. Manager Sarah"><br><br>
+          <label>Confirmed by</label><br>
+          <input name="confirmed_by" required style="width: 100%; padding: 8px;"><br><br>
 
-          <label>Proof (what happened — must be at least 10 characters)</label><br>
-          <input name="proof" required style="width: 100%; padding: 8px;"
-                 placeholder="e.g. Spoke to Sarah. Confirmed table for 4 at 19:00 under Test User. Ref ABC123"><br><br>
+          <label>Proof</label><br>
+          <input name="proof" required style="width: 100%; padding: 8px;"><br><br>
 
           <button type="submit" style="padding: 10px 16px;">Confirm now</button>
           <a href="/ui/status/{booking_id}" style="margin-left: 12px;">Cancel</a>
         </form>
-
-        <hr style="margin: 20px 0;">
-        <p><small><a href="/ui/status/{booking_id}">Back to status</a></small></p>
       </body>
     </html>
     """
 
-
 @app.post("/ui/confirm/{booking_id}")
 def ui_confirm_submit(
+    request: Request,
     booking_id: str,
     method: str = Form(...),
     confirmed_by: str = Form(...),
@@ -1063,79 +1087,9 @@ def ui_confirm_submit(
 ):
     confirm_booking(
         booking_id=booking_id,
+        request=request,
         proof=proof,
         confirmed_by=confirmed_by,
         method=method,
     )
     return ui_redirect_with_msg(f"/ui/status/{booking_id}", "Booking confirmed.")
-
-
-# =====================================================
-# Admin UI (Step 8)
-# =====================================================
-@app.get("/ui/admin", response_class=HTMLResponse)
-def ui_admin_home(msg: str = ""):
-    banner = f"<p style='background:#e7f3ff;padding:10px;border-radius:8px;border:1px solid #b3d7ff;'><strong>Info:</strong> {msg}</p>" if msg else ""
-    return f"""
-    <html>
-      <head><title>Admin Console</title></head>
-      <body style="font-family: Arial, sans-serif; max-width: 900px; margin: 40px auto;">
-        <h1>Admin Console</h1>
-        {banner}
-        <p>Enter your <code>ADMIN_TOKEN</code> and a booking ID to view raw booking data.</p>
-
-        <form action="/ui/admin/lookup" method="post">
-          <label>Admin token</label><br>
-          <input name="token" required style="width: 100%; padding: 8px;"><br><br>
-
-          <label>Booking ID</label><br>
-          <input name="booking_id" required style="width: 100%; padding: 8px;"><br><br>
-
-          <button type="submit" style="padding: 10px 16px;">Lookup booking</button>
-          <a href="/" style="margin-left: 12px;">Home</a>
-        </form>
-
-        <hr style="margin: 20px 0;">
-        <p><small>Tip: set ADMIN_TOKEN in Render → Environment.</small></p>
-      </body>
-    </html>
-    """
-
-
-@app.post("/ui/admin/lookup")
-def ui_admin_lookup(token: str = Form(...), booking_id: str = Form(...)):
-    # Redirect to view page (keeps UX simple)
-    return RedirectResponse(url=f"/ui/admin/booking/{booking_id}?token={quote(token)}", status_code=303)
-
-
-@app.get("/ui/admin/booking/{booking_id}", response_class=HTMLResponse)
-def ui_admin_booking_view(
-    booking_id: str,
-    token: str | None = None,
-    x_admin_token: str | None = Header(default=None, alias=ADMIN_TOKEN_HEADER),
-    msg: str = ""
-):
-    require_admin(token, x_admin_token)
-
-    booking_data = status(booking_id)
-    pretty = json.dumps(booking_data, indent=2, ensure_ascii=False)
-
-    banner = f"<p style='background:#e7f3ff;padding:10px;border-radius:8px;border:1px solid #b3d7ff;'><strong>Info:</strong> {msg}</p>" if msg else ""
-
-    return f"""
-    <html>
-      <head><title>Admin Booking View</title></head>
-      <body style="font-family: Arial, sans-serif; max-width: 1000px; margin: 40px auto;">
-        <h1>Admin — Booking</h1>
-        {banner}
-        <p><strong>Booking ID:</strong> {booking_id}</p>
-        <p><a href="/ui/status/{booking_id}">Open user status page</a></p>
-
-        <h2>Raw booking JSON</h2>
-        <pre style="background:#111;color:#eee;padding:14px;border-radius:10px;overflow:auto;">{pretty}</pre>
-
-        <hr style="margin: 20px 0;">
-        <p><small><a href="/ui/admin">Back to admin</a> | <a href="/">Home</a></small></p>
-      </body>
-    </html>
-    """
