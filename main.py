@@ -26,6 +26,7 @@ try:
     from twilio.base.exceptions import TwilioRestException
     from supabase import create_client, Client
     import stripe
+    from gotrue.errors import AuthRetryableError
 except ImportError as e:
     print(f"FATAL: Missing package: {e}")
     raise
@@ -1227,15 +1228,42 @@ def ui_login(msg: str = ""):
 @app.post("/ui/login")
 def ui_login_submit(email: str = Form(...)):
     if not supabase_auth:
-        raise HTTPException(status_code=500, detail="Auth not configured")
+        return ui_redirect_with_msg("/ui/login", "Authentication is not available right now. Please try again later.")
+    
+    # Normalize email
+    normalized_email = email.strip().lower()
     
     redirect_to = f"{Config.APP_BASE_URL}/auth/callback"
-    supabase_auth.auth.sign_in_with_otp({
-        "email": email,
-        "options": {"email_redirect_to": redirect_to}
-    })
     
-    return ui_redirect_with_msg("/ui/login", "Magic link sent. Check your email.")
+    # Try with one retry on retryable errors
+    for attempt in range(2):
+        try:
+            supabase_auth.auth.sign_in_with_otp({
+                "email": normalized_email,
+                "options": {"email_redirect_to": redirect_to}
+            })
+            
+            log_json("magic_link_sent", {"email": normalized_email, "attempt": attempt + 1})
+            return ui_redirect_with_msg("/ui/login", "Magic link sent. Check your email.")
+            
+        except AuthRetryableError as e:
+            if attempt == 0:
+                # First attempt failed with retryable error, sleep and retry
+                log_json("login_retry", {"error": str(e), "email": normalized_email})
+                time.sleep(1)
+                continue
+            else:
+                # Second attempt also failed
+                log_json("login_retryable_error", {"error": str(e), "email": normalized_email})
+                return ui_redirect_with_msg("/ui/login", "Service temporarily unavailable. Please try again in a moment.")
+        
+        except Exception as e:
+            # Unexpected error
+            log_json("login_error", {"error": str(e), "email": normalized_email, "attempt": attempt + 1})
+            return ui_redirect_with_msg("/ui/login", "Could not send magic link. Please check your email address and try again.")
+    
+    # Fallback (should never reach here)
+    return ui_redirect_with_msg("/ui/login", "Please try again.")
 
 @app.get("/auth/callback")
 def auth_callback(request: Request):
