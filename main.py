@@ -336,6 +336,16 @@ def has_confirmation_evidence(booking_id: str) -> bool:
     confirmation_types = {"CALL_SID", "HUMAN_NOTE", "TRANSCRIPT_SUMMARY"}
     return any(e.get("evidence_type") in confirmation_types for e in evidence)
 
+def evidence_has_type(booking_id: str, ev_type: str) -> bool:
+    """Check if evidence table contains a specific evidence type for a booking"""
+    if not supabase:
+        return False
+    try:
+        result = supabase.table("evidence").select("evidence_type").eq("booking_id", booking_id).eq("evidence_type", ev_type).execute()
+        return bool(result.data)
+    except Exception:
+        return False
+
 # ============================================================================
 # TWILIO INTEGRATION
 # ============================================================================
@@ -872,11 +882,19 @@ def confirm_booking(
     # Validate evidence requirements for phone confirmations
     if method == "phone":
         call_obj = booking_data.get("call") or {}
-        if not call_obj.get("call_sid"):
+        has_booking_call_sid = bool(call_obj.get("call_sid"))
+        has_evidence_call_sid = evidence_has_type(booking_id, "CALL_SID")
+        
+        if not has_booking_call_sid and not has_evidence_call_sid:
             raise HTTPException(status_code=400, detail="No call SID recorded")
+        
         outcome_obj = booking_data.get("call_outcome") or {}
         if outcome_obj.get("outcome") != "CONFIRMED":
             raise HTTPException(status_code=400, detail="Call outcome must be CONFIRMED")
+        
+        # Log which phone proof source was used
+        phone_proof_source = "booking_call_sid" if has_booking_call_sid else "evidence_call_sid"
+        log_event(booking_data, "phone_proof_verified", {"source": phone_proof_source})
     
     # Create human confirmation evidence
     create_evidence(
@@ -1498,13 +1516,13 @@ def ui_status(request: Request, booking_id: str, msg: str = ""):
           <button type="submit" style="padding: 8px 12px; margin-right: 10px;">Cancel</button>
         </form>
         """
-        if call_allowed and not armed and Config.REQUIRE_OPERATOR_ARM_FOR_CALL:
+        if call_allowed and not armed and Config.REQUIRE_OPERATOR_ARM_FOR_CALL and status_text == "pending":
             controls += f"""
             <form action="/ui/arm-call/{booking_id}" method="post" style="display:inline;">
               <button type="submit" style="padding: 8px 12px; margin-right: 10px;">ARM call</button>
             </form>
             """
-        if call_allowed and (armed or not Config.REQUIRE_OPERATOR_ARM_FOR_CALL):
+        if call_allowed and (armed or not Config.REQUIRE_OPERATOR_ARM_FOR_CALL) and status_text == "pending":
             controls += f"""
             <form action="/ui/call/{booking_id}" method="post" style="display:inline;">
               <button type="submit" style="padding: 8px 12px; margin-right: 10px;">📞 Place call</button>
@@ -1668,6 +1686,17 @@ def ui_confirm_form(request: Request, booking_id: str, msg: str = ""):
     rname = (req.get("restaurant_name") or "").strip() or "the restaurant"
     banner = f"<p style='background:#e7f3ff;padding:10px;border-radius:8px;'><strong>Info:</strong> {msg}</p>" if msg else ""
     
+    # Check for call SID evidence
+    call_obj = booking_data.get("call") or {}
+    has_booking_call_sid = bool(call_obj.get("call_sid"))
+    has_evidence_call_sid = evidence_has_type(booking_id, "CALL_SID")
+    
+    call_sid_banner = ""
+    if not has_booking_call_sid and has_evidence_call_sid:
+        call_sid_banner = "<p style='background:#e7f3ff;padding:10px;border-radius:8px;'><strong>Info:</strong> CALL_SID evidence exists (dry run).</p>"
+    elif not has_booking_call_sid and not has_evidence_call_sid:
+        call_sid_banner = "<p style='background:#e7f3ff;padding:10px;border-radius:8px;'><strong>Info:</strong> No call SID evidence recorded.</p>"
+    
     return f"""
     <html>
       <head><title>Confirm Booking</title></head>
@@ -1675,6 +1704,7 @@ def ui_confirm_form(request: Request, booking_id: str, msg: str = ""):
         <h1>✅ Confirm Booking</h1>
         {banner}
         <p><strong>Restaurant:</strong> {rname}</p>
+        {call_sid_banner}
         
         <p style="background:#fff3cd;padding:12px;border-radius:8px;">
           ⚠️ Only confirm if you have real proof. This creates evidence.
