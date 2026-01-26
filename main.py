@@ -25,6 +25,7 @@ try:
     from twilio.rest import Client as TwilioClient
     from twilio.base.exceptions import TwilioRestException
     from supabase import create_client, Client
+    import stripe
 except ImportError as e:
     print(f"FATAL: Missing package: {e}")
     raise
@@ -79,6 +80,12 @@ class Config:
     # App base URL for webhooks
     APP_BASE_URL: str = os.getenv("APP_BASE_URL", "https://ai-dining-concierge.onrender.com")
     
+    # Stripe
+    STRIPE_SECRET_KEY: str = os.getenv("STRIPE_SECRET_KEY", "")
+    STRIPE_WEBHOOK_SECRET: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+    STRIPE_PRICE_CENTS: int = int(os.getenv("STRIPE_PRICE_CENTS", "200"))
+    STRIPE_CURRENCY: str = os.getenv("STRIPE_CURRENCY", "nzd")
+    
     @classmethod
     def validate(cls):
         """Validate critical config"""
@@ -98,6 +105,10 @@ Config.validate()
 # Initialize clients
 supabase: Client = create_client(Config.SUPABASE_URL, Config.SUPABASE_KEY) if Config.SUPABASE_URL and Config.SUPABASE_KEY else None
 supabase_auth: Client = create_client(Config.SUPABASE_URL, Config.SUPABASE_ANON_KEY) if Config.SUPABASE_URL and Config.SUPABASE_ANON_KEY else None
+
+# Initialize Stripe
+if Config.STRIPE_SECRET_KEY:
+    stripe.api_key = Config.STRIPE_SECRET_KEY
 
 # ============================================================================
 # HELPERS
@@ -527,6 +538,9 @@ def health():
         "require_operator_arm": Config.REQUIRE_OPERATOR_ARM_FOR_CALL,
         "admin_token_configured": bool(Config.ADMIN_TOKEN),
         "session_secret_configured": bool(Config.SESSION_SECRET),
+        "stripe_configured": bool(Config.STRIPE_SECRET_KEY and Config.STRIPE_WEBHOOK_SECRET),
+        "stripe_price_cents": Config.STRIPE_PRICE_CENTS,
+        "stripe_currency": Config.STRIPE_CURRENCY,
     }
 
 @app.post("/book")
@@ -570,6 +584,13 @@ def book(req: BookingRequest, request: Request):
         "final_reason": None,
         "operator_call_armed": False,
         "operator_armed_at": None,
+        "payment": {
+            "payment_status": "unpaid",
+            "amount_cents": Config.STRIPE_PRICE_CENTS,
+            "currency": Config.STRIPE_CURRENCY,
+            "stripe_checkout_session_id": None,
+            "paid_at": None,
+        },
     }
     
     booking_data["expires_at"] = compute_expires_at(booking_data["created_at"])
@@ -889,6 +910,166 @@ def confirm_booking(
     }
 
 # ============================================================================
+# PAYMENT ENDPOINTS (Stripe)
+# ============================================================================
+
+@app.post("/pay/{booking_id}")
+def create_payment_session(booking_id: str, request: Request):
+    """Create Stripe checkout session for confirmed booking"""
+    user = require_login(request)
+    
+    if not Config.STRIPE_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="Stripe not configured")
+    
+    booking_data = status(booking_id, request)
+    
+    # Only allow payment for confirmed bookings
+    if booking_data.get("status") != "confirmed":
+        raise HTTPException(status_code=400, detail="Payment only available for confirmed bookings")
+    
+    # Check if already paid
+    payment = booking_data.get("payment") or {}
+    if payment.get("payment_status") == "paid":
+        return {"message": "Already paid", "paid_at": payment.get("paid_at")}
+    
+    # Create Stripe checkout session
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            line_items=[{
+                "price_data": {
+                    "currency": Config.STRIPE_CURRENCY,
+                    "unit_amount": Config.STRIPE_PRICE_CENTS,
+                    "product_data": {
+                        "name": "Tabel booking success fee",
+                    },
+                },
+                "quantity": 1,
+            }],
+            success_url=f"{Config.APP_BASE_URL}/ui/status/{booking_id}?msg=Payment+successful",
+            cancel_url=f"{Config.APP_BASE_URL}/ui/status/{booking_id}?msg=Payment+cancelled",
+            metadata={
+                "booking_id": booking_id,
+                "user_id": user["id"],
+            },
+        )
+        
+        # Update booking with session info
+        if "payment" not in booking_data:
+            booking_data["payment"] = {
+                "payment_status": "unpaid",
+                "amount_cents": Config.STRIPE_PRICE_CENTS,
+                "currency": Config.STRIPE_CURRENCY,
+                "stripe_checkout_session_id": None,
+                "paid_at": None,
+            }
+        
+        booking_data["payment"]["stripe_checkout_session_id"] = session.id
+        booking_data["payment"]["payment_status"] = "pending"
+        log_event(booking_data, "payment_session_created", {
+            "session_id": session.id,
+            "amount_cents": Config.STRIPE_PRICE_CENTS,
+            "currency": Config.STRIPE_CURRENCY,
+        })
+        
+        supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
+        
+        log_json("payment_session_created", {
+            "booking_id": booking_id,
+            "session_id": session.id,
+            "amount_cents": Config.STRIPE_PRICE_CENTS,
+        })
+        
+        return {"checkout_url": session.url}
+        
+    except stripe.error.StripeError as e:
+        log_json("stripe_error", {"error": str(e), "booking_id": booking_id})
+        raise HTTPException(status_code=500, detail=f"Payment error: {str(e)}")
+
+@app.post("/webhooks/stripe")
+async def stripe_webhook(request: Request):
+    """Handle Stripe webhook events"""
+    if not Config.STRIPE_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Webhook secret not configured")
+    
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    
+    if not sig_header:
+        raise HTTPException(status_code=400, detail="Missing signature")
+    
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, Config.STRIPE_WEBHOOK_SECRET
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    
+    # Handle checkout.session.completed
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        booking_id = session["metadata"].get("booking_id")
+        user_id = session["metadata"].get("user_id")
+        
+        if not booking_id or not user_id:
+            log_json("webhook_missing_metadata", {"session_id": session.get("id")})
+            return {"status": "ignored"}
+        
+        # Fetch booking
+        if not supabase:
+            log_json("webhook_error", {"error": "Supabase not configured"})
+            return {"status": "error"}
+        
+        result = supabase.table("bookings").select("data").eq("id", booking_id).execute()
+        if not result.data:
+            log_json("webhook_booking_not_found", {"booking_id": booking_id})
+            return {"status": "ignored"}
+        
+        booking_data = result.data[0]["data"]
+        
+        # Verify user_id matches
+        if booking_data.get("user_id") != user_id:
+            log_json("webhook_user_mismatch", {
+                "booking_id": booking_id,
+                "expected_user": user_id,
+                "actual_user": booking_data.get("user_id")
+            })
+            return {"status": "ignored"}
+        
+        # Verify session_id matches
+        payment = booking_data.get("payment") or {}
+        if payment.get("stripe_checkout_session_id") != session.get("id"):
+            log_json("webhook_session_mismatch", {
+                "booking_id": booking_id,
+                "expected_session": session.get("id"),
+                "actual_session": payment.get("stripe_checkout_session_id")
+            })
+            return {"status": "ignored"}
+        
+        # Update payment status
+        if "payment" not in booking_data:
+            booking_data["payment"] = {
+                "amount_cents": Config.STRIPE_PRICE_CENTS,
+                "currency": Config.STRIPE_CURRENCY,
+                "stripe_checkout_session_id": session.get("id"),
+            }
+        
+        booking_data["payment"]["payment_status"] = "paid"
+        booking_data["payment"]["paid_at"] = now_iso()
+        log_event(booking_data, "payment_confirmed", {"session_id": session.get("id")})
+        
+        supabase.table("bookings").update({"data": booking_data}).eq("id", booking_id).execute()
+        
+        log_json("payment_confirmed", {
+            "booking_id": booking_id,
+            "session_id": session.get("id"),
+        })
+    
+    return {"status": "success"}
+
+# ============================================================================
 # ADMIN API (with evidence support)
 # ============================================================================
 
@@ -1108,10 +1289,21 @@ def ui_logout():
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     if request.url.path.startswith("/ui/") or request.url.path.startswith("/auth/"):
+        msg = exc.detail if isinstance(exc.detail, str) else "Something went wrong."
+        
+        # Only redirect to login for auth errors
         if exc.status_code == 401:
             return ui_redirect_with_msg("/ui/login", "Please log in first.")
-        msg = exc.detail if isinstance(exc.detail, str) else "Something went wrong."
-        return ui_redirect_with_msg("/ui/login", msg)
+        
+        # For other errors, redirect back to referer or to /ui/book
+        referer = request.headers.get("referer")
+        if referer and referer.startswith(Config.APP_BASE_URL):
+            # Extract path from referer
+            referer_path = referer.replace(Config.APP_BASE_URL, "")
+            return ui_redirect_with_msg(referer_path, msg)
+        
+        return ui_redirect_with_msg("/ui/book", msg)
+    
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 @app.get("/", response_class=HTMLResponse)
@@ -1238,8 +1430,22 @@ def ui_status(request: Request, booking_id: str, msg: str = ""):
     armed = booking_data.get("operator_call_armed") is True
     terminal = terminal_status(status_text)
     
+    # Payment info
+    payment = booking_data.get("payment") or {}
+    payment_status = payment.get("payment_status", "unpaid")
+    payment_amount_cents = payment.get("amount_cents", Config.STRIPE_PRICE_CENTS)
+    payment_currency = payment.get("currency", Config.STRIPE_CURRENCY).upper()
+    payment_display = f"${payment_amount_cents / 100:.2f} {payment_currency}"
+    
     banner = f"<p style='background:#e7f3ff;padding:10px;border-radius:8px;'><strong>Info:</strong> {msg}</p>" if msg else ""
     reason_line = f"<p><strong>Final reason:</strong> {final_reason}</p>" if final_reason else ""
+    
+    # Payment status line
+    payment_line = f"<p><strong>Payment:</strong> {payment_status}"
+    if payment_status == "paid":
+        paid_at = payment.get("paid_at", "")
+        payment_line += f" ✅ <small>(paid at {paid_at})</small>"
+    payment_line += "</p>"
     
     # Evidence display
     evidence_html = ""
@@ -1277,6 +1483,14 @@ def ui_status(request: Request, booking_id: str, msg: str = ""):
             </form>
             """
     
+    # Payment button for confirmed bookings that aren't paid yet
+    if status_text == "confirmed" and payment_status != "paid":
+        controls += f"""
+        <form action="/ui/pay/{booking_id}" method="post" style="display:inline;">
+          <button type="submit" style="padding: 8px 12px; margin-right: 10px; background: #10b981; color: white; border: none; border-radius: 4px;">💳 Pay now ({payment_display})</button>
+        </form>
+        """
+    
     html = f"""
     <html>
       <head><title>Booking Status</title></head>
@@ -1284,6 +1498,7 @@ def ui_status(request: Request, booking_id: str, msg: str = ""):
         <h1>📊 Booking Status</h1>
         {banner}
         <p><strong>Status:</strong> {status_text}</p>
+        {payment_line}
         <p><strong>Next action:</strong> {next_action}</p>
         <p><strong>Expires at:</strong> {expires_at}</p>
         {reason_line}
@@ -1342,6 +1557,22 @@ def ui_call(request: Request, booking_id: str):
 def ui_cancel(request: Request, booking_id: str):
     cancel_booking(booking_id, request, reason="user_cancelled")
     return ui_redirect_with_msg(f"/ui/status/{booking_id}", "Booking cancelled")
+
+@app.post("/ui/pay/{booking_id}")
+def ui_pay(request: Request, booking_id: str):
+    """UI endpoint to initiate payment - redirects to Stripe checkout"""
+    try:
+        result = create_payment_session(booking_id, request)
+        checkout_url = result.get("checkout_url")
+        if checkout_url:
+            return RedirectResponse(url=checkout_url, status_code=303)
+        # Already paid case
+        return ui_redirect_with_msg(f"/ui/status/{booking_id}", result.get("message", "Already paid"))
+    except HTTPException as e:
+        return ui_redirect_with_msg(f"/ui/status/{booking_id}", f"Payment error: {e.detail}")
+    except Exception as e:
+        log_json("ui_pay_error", {"error": str(e), "booking_id": booking_id})
+        return ui_redirect_with_msg(f"/ui/status/{booking_id}", "Payment error. Please try again.")
 
 @app.get("/ui/call-outcome/{booking_id}", response_class=HTMLResponse)
 def ui_call_outcome_form(request: Request, booking_id: str, msg: str = ""):
