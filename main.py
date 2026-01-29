@@ -881,16 +881,16 @@ def confirm_booking(
     
     # Validate evidence requirements for phone confirmations
     if method == "phone":
+        outcome_obj = booking_data.get("call_outcome") or {}
+        if outcome_obj.get("outcome") != "CONFIRMED":
+            raise HTTPException(status_code=400, detail="Call outcome must be CONFIRMED")
+        
         call_obj = booking_data.get("call") or {}
         has_booking_call_sid = bool(call_obj.get("call_sid"))
         has_evidence_call_sid = evidence_has_type(booking_id, "CALL_SID")
         
         if not has_booking_call_sid and not has_evidence_call_sid:
-            raise HTTPException(status_code=400, detail="No call SID recorded")
-        
-        outcome_obj = booking_data.get("call_outcome") or {}
-        if outcome_obj.get("outcome") != "CONFIRMED":
-            raise HTTPException(status_code=400, detail="Call outcome must be CONFIRMED")
+            raise HTTPException(status_code=400, detail="Cannot confirm by phone without call SID evidence.")
         
         # Log which phone proof source was used
         phone_proof_source = "booking_call_sid" if has_booking_call_sid else "evidence_call_sid"
@@ -1696,16 +1696,17 @@ def ui_confirm_form(request: Request, booking_id: str, msg: str = ""):
     has_any_call_sid = has_booking_call_sid or has_evidence_call_sid
     can_confirm_by_phone = has_any_call_sid and outcome == "CONFIRMED"
     
+    # Banner logic per requirements
     call_sid_banner = ""
-    if not has_booking_call_sid and has_evidence_call_sid:
-        call_sid_banner = "<p style='background:#e7f3ff;padding:10px;border-radius:8px;'><strong>Info:</strong> CALL_SID evidence exists (dry run).</p>"
+    if outcome != "CONFIRMED":
+        call_sid_banner = "<p style='background:#fff4e6;padding:10px;border-radius:8px;'><strong>⚠️ Warning:</strong> Phone requires CONFIRMED call outcome.</p>"
+    elif outcome == "CONFIRMED" and not has_booking_call_sid and has_evidence_call_sid:
+        call_sid_banner = "<p style='background:#e7f3ff;padding:10px;border-radius:8px;'><strong>Info:</strong> CALL_SID evidence exists (dry run). Phone confirmation allowed.</p>"
     elif not has_any_call_sid:
-        call_sid_banner = "<p style='background:#fff4e6;padding:10px;border-radius:8px;'><strong>⚠️ Note:</strong> No call SID evidence recorded. Cannot confirm by phone. Use 'digital' or 'in_person' method instead.</p>"
-    elif has_any_call_sid and outcome != "CONFIRMED":
-        call_sid_banner = "<p style='background:#fff4e6;padding:10px;border-radius:8px;'><strong>⚠️ Note:</strong> Call outcome must be CONFIRMED to use phone method. Current outcome: {outcome or 'not recorded'}. Record call outcome first or use 'digital'/'in_person' method.</p>"
+        call_sid_banner = "<p style='background:#fff4e6;padding:10px;border-radius:8px;'><strong>⚠️ Warning:</strong> No call SID evidence recorded. Phone confirmation not allowed.</p>"
     
     # Build method options - disable phone if can't use it
-    phone_option = '<option value="phone">phone</option>' if can_confirm_by_phone else '<option value="phone" disabled>phone (requires call + CONFIRMED outcome)</option>'
+    phone_option = '<option value="phone">phone</option>' if can_confirm_by_phone else '<option value="phone" disabled>phone (requires call SID + CONFIRMED outcome)</option>'
     
     return f"""
     <html>
