@@ -1686,16 +1686,26 @@ def ui_confirm_form(request: Request, booking_id: str, msg: str = ""):
     rname = (req.get("restaurant_name") or "").strip() or "the restaurant"
     banner = f"<p style='background:#e7f3ff;padding:10px;border-radius:8px;'><strong>Info:</strong> {msg}</p>" if msg else ""
     
-    # Check for call SID evidence
+    # Check for call SID evidence and call outcome
     call_obj = booking_data.get("call") or {}
     has_booking_call_sid = bool(call_obj.get("call_sid"))
     has_evidence_call_sid = evidence_has_type(booking_id, "CALL_SID")
+    outcome_obj = booking_data.get("call_outcome") or {}
+    outcome = outcome_obj.get("outcome")
+    
+    has_any_call_sid = has_booking_call_sid or has_evidence_call_sid
+    can_confirm_by_phone = has_any_call_sid and outcome == "CONFIRMED"
     
     call_sid_banner = ""
     if not has_booking_call_sid and has_evidence_call_sid:
         call_sid_banner = "<p style='background:#e7f3ff;padding:10px;border-radius:8px;'><strong>Info:</strong> CALL_SID evidence exists (dry run).</p>"
-    elif not has_booking_call_sid and not has_evidence_call_sid:
-        call_sid_banner = "<p style='background:#e7f3ff;padding:10px;border-radius:8px;'><strong>Info:</strong> No call SID evidence recorded.</p>"
+    elif not has_any_call_sid:
+        call_sid_banner = "<p style='background:#fff4e6;padding:10px;border-radius:8px;'><strong>⚠️ Note:</strong> No call SID evidence recorded. Cannot confirm by phone. Use 'digital' or 'in_person' method instead.</p>"
+    elif has_any_call_sid and outcome != "CONFIRMED":
+        call_sid_banner = "<p style='background:#fff4e6;padding:10px;border-radius:8px;'><strong>⚠️ Note:</strong> Call outcome must be CONFIRMED to use phone method. Current outcome: {outcome or 'not recorded'}. Record call outcome first or use 'digital'/'in_person' method.</p>"
+    
+    # Build method options - disable phone if can't use it
+    phone_option = '<option value="phone">phone</option>' if can_confirm_by_phone else '<option value="phone" disabled>phone (requires call + CONFIRMED outcome)</option>'
     
     return f"""
     <html>
@@ -1713,8 +1723,8 @@ def ui_confirm_form(request: Request, booking_id: str, msg: str = ""):
         <form action="/ui/confirm/{booking_id}" method="post">
           <label>Method</label><br>
           <select name="method" required style="width: 100%; padding: 8px;">
-            <option value="phone">phone</option>
-            <option value="digital">digital</option>
+            {phone_option}
+            <option value="digital" selected>digital</option>
             <option value="in_person">in_person</option>
           </select><br><br>
           
